@@ -129,10 +129,9 @@ func (h *HealthHandler) Health(c *gin.Context) {
 	httpStatusCode := http.StatusOK
 
 	if !allHealthy {
+		overallStatus = "degraded"
 		if hasFailure {
-			overallStatus = "degraded"
-		} else {
-			overallStatus = "degraded"
+			httpStatusCode = http.StatusServiceUnavailable
 		}
 	}
 
@@ -142,6 +141,61 @@ func (h *HealthHandler) Health(c *gin.Context) {
 	}
 
 	c.JSON(httpStatusCode, resp)
+}
+
+// @Summary Liveness check
+// @Description Reports liveness status of the API service.
+// @Tags Health
+// @Produce json
+// @Success 200 {object} HealthResponse
+// @Router /health/live [get]
+func (h *HealthHandler) Liveness(c *gin.Context) {
+	c.JSON(http.StatusOK, HealthResponse{
+		Status: "ok",
+	})
+}
+
+// @Summary Readiness check
+// @Description Reports readiness status of core dependencies (PostgreSQL, Redis, RabbitMQ).
+// @Tags Health
+// @Produce json
+// @Success 200 {object} HealthResponse
+// @Failure 503 {object} HealthResponse
+// @Router /health/ready [get]
+func (h *HealthHandler) Readiness(c *gin.Context) {
+	timeout := h.checkTimeout
+	deps := make(map[string]DependencyStatus)
+	allHealthy := true
+
+	postgresStatus := h.checkPostgres(timeout)
+	deps["postgres"] = postgresStatus
+	if postgresStatus.Status != "healthy" {
+		allHealthy = false
+	}
+
+	redisStatus := h.checkRedis(timeout)
+	deps["redis"] = redisStatus
+	if redisStatus.Status != "healthy" {
+		allHealthy = false
+	}
+
+	rabbitmqStatus := h.checkRabbitMQ()
+	deps["rabbitmq"] = rabbitmqStatus
+	if rabbitmqStatus.Status != "healthy" {
+		allHealthy = false
+	}
+
+	overallStatus := "ready"
+	httpStatusCode := http.StatusOK
+	if !allHealthy {
+		overallStatus = "not ready"
+		httpStatusCode = http.StatusServiceUnavailable
+	}
+
+	c.JSON(httpStatusCode, HealthResponse{
+		Status:       overallStatus,
+		Dependencies: deps,
+	})
 }
 
 func (h *HealthHandler) checkPostgres(timeout time.Duration) DependencyStatus {
@@ -288,39 +342,4 @@ func (h *HealthHandler) checkHorizon(timeout time.Duration) DependencyStatus {
 		Latency: fmt.Sprintf("%v", latency),
 		Message: "reachable",
 	}
-}
-
-// @Summary Readiness check
-// @Description Readiness probe — checks database, Redis, RabbitMQ, and Stellar Horizon connectivity.
-// @Tags Health
-// @Produce json
-// @Success 200 {object} object{status=string}
-// @Failure 503 {object} object{status=string,error=string}
-// @Router /ready [get]
-func (h *HealthHandler) Ready(c *gin.Context) {
-	ctx := c.Request.Context()
-	if h.db != nil {
-		if err := h.db.PingContext(ctx); err != nil {
-			c.JSON(503, gin.H{"status": "not ready", "error": "database unreachable"})
-			return
-		}
-	}
-	if h.redis != nil {
-		if err := h.redis.Ping(ctx).Err(); err != nil {
-			c.JSON(503, gin.H{"status": "not ready", "error": "redis unreachable"})
-			return
-		}
-	}
-	if h.rabbit != nil && !h.rabbit.IsAlive() {
-		c.JSON(503, gin.H{"status": "not ready", "error": "rabbitmq unreachable"})
-		return
-	}
-	if h.horizonURL != "" {
-		horizonStatus := h.checkHorizon(h.checkTimeout)
-		if horizonStatus.Status != "healthy" {
-			c.JSON(503, gin.H{"status": "not ready", "error": "stellar horizon unreachable: " + horizonStatus.Message})
-			return
-		}
-	}
-	c.JSON(200, gin.H{"status": "ready"})
 }
