@@ -110,9 +110,9 @@ func TestDispatchDelivery_SkipsInAppChannel(t *testing.T) {
 	repo.On("Create", mock.Anything, mock.Anything).Return(nil)
 
 	_, err := svc.Create(context.Background(), notification.CreateInput{
-		UserID:  uuid.New().String(),
-		Type:    notification.TypeCircleCreated,
-		Title:   "t", Body: "b",
+		UserID: uuid.New().String(),
+		Type:   notification.TypeCircleCreated,
+		Title:  "t", Body: "b",
 		Channel: notification.ChannelInApp,
 	})
 	require.NoError(t, err)
@@ -141,9 +141,9 @@ func TestDispatchDelivery_SkippedWhenRecipientDoesNotAllowChannel(t *testing.T) 
 	repo.On("Create", mock.Anything, mock.Anything).Return(nil)
 
 	_, err := svc.Create(context.Background(), notification.CreateInput{
-		UserID:  uuid.New().String(),
-		Type:    notification.TypeCircleCreated,
-		Title:   "t", Body: "b",
+		UserID: uuid.New().String(),
+		Type:   notification.TypeCircleCreated,
+		Title:  "t", Body: "b",
 		Channel: notification.ChannelEmail,
 	})
 	require.NoError(t, err)
@@ -171,9 +171,9 @@ func TestDispatchDelivery_SkippedWhenRecipientMuted(t *testing.T) {
 	repo.On("Create", mock.Anything, mock.Anything).Return(nil)
 
 	_, err := svc.Create(context.Background(), notification.CreateInput{
-		UserID:  uuid.New().String(),
-		Type:    notification.TypeCircleCreated,
-		Title:   "t", Body: "b",
+		UserID: uuid.New().String(),
+		Type:   notification.TypeCircleCreated,
+		Title:  "t", Body: "b",
 		Channel: notification.ChannelEmail,
 	})
 	require.NoError(t, err)
@@ -199,9 +199,9 @@ func TestDispatchDelivery_RecordsSentOnSuccess(t *testing.T) {
 	repo.On("Create", mock.Anything, mock.Anything).Return(nil)
 
 	_, err := svc.Create(context.Background(), notification.CreateInput{
-		UserID:  uuid.New().String(),
-		Type:    notification.TypeCircleCreated,
-		Title:   "t", Body: "b",
+		UserID: uuid.New().String(),
+		Type:   notification.TypeCircleCreated,
+		Title:  "t", Body: "b",
 		Channel: notification.ChannelEmail,
 	})
 	require.NoError(t, err)
@@ -236,9 +236,9 @@ func TestDispatchDelivery_RetriesOnceThenRecordsFailed(t *testing.T) {
 	repo.On("Create", mock.Anything, mock.Anything).Return(nil)
 
 	_, err := svc.Create(context.Background(), notification.CreateInput{
-		UserID:  uuid.New().String(),
-		Type:    notification.TypeCircleCreated,
-		Title:   "t", Body: "b",
+		UserID: uuid.New().String(),
+		Type:   notification.TypeCircleCreated,
+		Title:  "t", Body: "b",
 		Channel: notification.ChannelEmail,
 	})
 	require.NoError(t, err)
@@ -274,9 +274,9 @@ func TestDispatchDelivery_RecoversOnRetry(t *testing.T) {
 	repo.On("Create", mock.Anything, mock.Anything).Return(nil)
 
 	_, err := svc.Create(context.Background(), notification.CreateInput{
-		UserID:  uuid.New().String(),
-		Type:    notification.TypeCircleCreated,
-		Title:   "t", Body: "b",
+		UserID: uuid.New().String(),
+		Type:   notification.TypeCircleCreated,
+		Title:  "t", Body: "b",
 		Channel: notification.ChannelEmail,
 	})
 	require.NoError(t, err)
@@ -303,9 +303,9 @@ func TestDispatchDelivery_FailedRecipientLookupIsAudited(t *testing.T) {
 	repo.On("Create", mock.Anything, mock.Anything).Return(nil)
 
 	_, err := svc.Create(context.Background(), notification.CreateInput{
-		UserID:  uuid.New().String(),
-		Type:    notification.TypeCircleCreated,
-		Title:   "t", Body: "b",
+		UserID: uuid.New().String(),
+		Type:   notification.TypeCircleCreated,
+		Title:  "t", Body: "b",
 		Channel: notification.ChannelEmail,
 	})
 	require.NoError(t, err)
@@ -328,9 +328,9 @@ func TestDispatchDelivery_NoOpWhenNotConfigured(t *testing.T) {
 	repo.On("Create", mock.Anything, mock.Anything).Return(nil)
 
 	result, err := svc.Create(context.Background(), notification.CreateInput{
-		UserID:  uuid.New().String(),
-		Type:    notification.TypeCircleCreated,
-		Title:   "t", Body: "b",
+		UserID: uuid.New().String(),
+		Type:   notification.TypeCircleCreated,
+		Title:  "t", Body: "b",
 		Channel: notification.ChannelEmail,
 	})
 	require.NoError(t, err)
