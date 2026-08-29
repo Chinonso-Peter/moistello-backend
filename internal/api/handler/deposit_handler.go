@@ -13,6 +13,7 @@ import (
 	"github.com/moistello/backend/internal/api/middleware"
 	"github.com/moistello/backend/internal/domain/deposit"
 	"github.com/moistello/backend/internal/domain/featureflag"
+	"github.com/moistello/backend/internal/domain/fx"
 	"github.com/moistello/backend/internal/domain/wallet"
 	"github.com/moistello/backend/internal/domain/withdrawal"
 	"github.com/moistello/backend/internal/domain/yellowcard"
@@ -21,18 +22,35 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+// rateQuoteTTL bounds how long a fetched FX rate is reused before the
+// pricing path re-queries the provider. See fx.CachingRateProvider.
+const rateQuoteTTL = 30 * time.Second
+
+// defaultCurrency is used when a request omits an explicit currency, so
+// existing NGN-only callers keep working unchanged.
+const defaultCurrency = "NGN"
+
 type DepositHandler struct {
-	yc          *yellowcard.Client
-	wallet      wallet.Service
-	rdb         *redis.Client
-	cfg         config.YellowCardConfig
-	deposits    deposit.Repository
-	withdrawals withdrawal.Repository
-	flags       *featureflag.Cache
+	yc           *yellowcard.Client
+	wallet       wallet.Service
+	rdb          *redis.Client
+	cfg          config.YellowCardConfig
+	deposits     deposit.Repository
+	withdrawals  withdrawal.Repository
+	flags        *featureflag.Cache
+	rateProvider fx.RateProvider
 }
 
 func NewDepositHandler(yc *yellowcard.Client, walletSvc wallet.Service) *DepositHandler {
-	return &DepositHandler{yc: yc, wallet: walletSvc}
+	return &DepositHandler{
+		yc:     yc,
+		wallet: walletSvc,
+		// Wrapped in a cache+fallback decorator (issue #189) so a
+		// transient Yellow Card outage doesn't hard-fail every quote —
+		// see fx.CachingRateProvider's doc comment for the fallback
+		// semantics.
+		rateProvider: fx.NewCachingRateProvider(fx.NewYellowCardRateProvider(yc), rateQuoteTTL),
+	}
 }
 
 func (h *DepositHandler) WithRedis(rdb *redis.Client) *DepositHandler {
@@ -59,6 +77,51 @@ func (h *DepositHandler) WithRepositories(deposits deposit.Repository, withdrawa
 func (h *DepositHandler) WithFeatureFlags(flags *featureflag.Cache) *DepositHandler {
 	h.flags = flags
 	return h
+}
+
+// WithRateProvider overrides the default cached Yellow Card provider —
+// primarily for tests, but also lets a future multi-source aggregator be
+// swapped in without touching the handler's request-handling logic.
+func (h *DepositHandler) WithRateProvider(rp fx.RateProvider) *DepositHandler {
+	h.rateProvider = rp
+	return h
+}
+
+// resolveCurrency normalizes and validates a request-supplied currency
+// code, defaulting to NGN when empty. Returns an error message suitable
+// for direct display to the caller when the currency isn't supported.
+func resolveCurrency(raw string) (string, string) {
+	code := strings.ToUpper(strings.TrimSpace(raw))
+	if code == "" {
+		code = defaultCurrency
+	}
+	if !fx.IsSupportedFiatCurrency(code) {
+		return "", fmt.Sprintf("unsupported currency %q", code)
+	}
+	return code, ""
+}
+
+// currencyCaps resolves the per-transaction/daily caps for a currency.
+// NGN falls back to the legacy top-level config fields for backward
+// compatibility with existing deployments; any other currency must have an
+// explicit entry in cfg.CurrencyCaps, since moving real money in a new
+// corridor without a deliberately configured cap is a business risk this
+// handler won't take on by default. ok is false when the currency has no
+// caps configured, meaning deposits/withdrawals aren't enabled for it yet
+// even though it may still be quotable via GetDepositQuote.
+func (h *DepositHandler) currencyCaps(currency string) (caps config.CurrencyCaps, ok bool) {
+	if c, found := h.cfg.CurrencyCaps[currency]; found {
+		return c, true
+	}
+	if currency == defaultCurrency {
+		return config.CurrencyCaps{
+			MaxDeposit:       h.maxDepositNGN(),
+			MaxWithdraw:      h.maxWithdrawUSDC(),
+			DailyDepositCap:  h.dailyDepositCapNGN(),
+			DailyWithdrawCap: h.dailyWithdrawCapUSDC(),
+		}, true
+	}
+	return config.CurrencyCaps{}, false
 }
 
 func (h *DepositHandler) maxDepositNGN() float64 {
@@ -100,8 +163,9 @@ func getIdempotencyKey(c *gin.Context, bodyKey string) string {
 	return key
 }
 
-// GetDepositQuote returns a NGN→USDC quote
-// GET /v1/wallet/deposit/quote?amount=50000
+// GetDepositQuote returns a <currency>→USDC quote. currency defaults to NGN
+// and must be one of fx.SupportedFiatCurrencies.
+// GET /v1/wallet/deposit/quote?amount=50000&currency=NGN
 func (h *DepositHandler) GetDepositQuote(c *gin.Context) {
 	amountStr := c.Query("amount")
 	if amountStr == "" {
@@ -115,7 +179,13 @@ func (h *DepositHandler) GetDepositQuote(c *gin.Context) {
 		return
 	}
 
-	quote, err := h.yc.GetQuote("NGN", "USDC", amount)
+	currency, errMsg := resolveCurrency(c.Query("currency"))
+	if errMsg != "" {
+		response.BadRequest(c, errMsg)
+		return
+	}
+
+	quote, err := h.rateProvider.GetQuote(c.Request.Context(), currency, "USDC", amount)
 	if err != nil {
 		response.InternalError(c, "failed to get quote: "+err.Error())
 		return
@@ -124,17 +194,38 @@ func (h *DepositHandler) GetDepositQuote(c *gin.Context) {
 	response.OK(c, gin.H{"quote": quote})
 }
 
-// InitiateDeposit creates a deposit request (NGN → USDC)
+// InitiateDeposit creates a deposit request (<currency> → USDC). currency
+// defaults to NGN. A currency needs an entry in
+// config.YellowCardConfig.CurrencyCaps (or to be NGN, which falls back to
+// the legacy top-level cap fields) to be accepted here — see
+// (*DepositHandler).currencyCaps.
 // POST /v1/wallet/deposit
 func (h *DepositHandler) InitiateDeposit(c *gin.Context) {
 	userID := middleware.GetUserID(c)
 
 	var req struct {
+		// AmountNGN is the deposit amount in the request currency. The
+		// field name predates multi-currency support (issue #189) and is
+		// kept for backward compatibility with existing NGN-only callers;
+		// it is not restricted to NGN when Currency is set to something
+		// else.
 		AmountNGN      float64 `json:"amountNgn" binding:"required,gt=0"`
+		Currency       string  `json:"currency"`
 		IdempotencyKey string  `json:"idempotencyKey"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "amountNgn is required")
+		return
+	}
+
+	currency, errMsg := resolveCurrency(req.Currency)
+	if errMsg != "" {
+		response.BadRequest(c, errMsg)
+		return
+	}
+	caps, capsOK := h.currencyCaps(currency)
+	if !capsOK {
+		response.BadRequest(c, fmt.Sprintf("deposits are not yet enabled for currency %q", currency))
 		return
 	}
 
@@ -143,7 +234,7 @@ func (h *DepositHandler) InitiateDeposit(c *gin.Context) {
 
 	// Check idempotency cache in Redis
 	if idempotencyKey != "" && h.rdb != nil {
-		cachedKey := fmt.Sprintf("yc:idempotency:deposit:%s:%s", userID, idempotencyKey)
+		cachedKey := fmt.Sprintf("yc:idempotency:deposit:%s:%s:%s", userID, currency, idempotencyKey)
 		cachedData, err := h.rdb.Get(ctx, cachedKey).Bytes()
 		if err == nil && len(cachedData) > 0 {
 			var cachedResp gin.H
@@ -155,20 +246,18 @@ func (h *DepositHandler) InitiateDeposit(c *gin.Context) {
 	}
 
 	// Validate per-transaction amount cap
-	maxDeposit := h.maxDepositNGN()
-	if req.AmountNGN > maxDeposit {
-		response.BadRequest(c, fmt.Sprintf("deposit amount exceeds maximum allowed limit of %.2f NGN", maxDeposit))
+	if req.AmountNGN > caps.MaxDeposit {
+		response.BadRequest(c, fmt.Sprintf("deposit amount exceeds maximum allowed limit of %.2f %s", caps.MaxDeposit, currency))
 		return
 	}
 
 	// Validate daily amount cap
-	dailyCap := h.dailyDepositCapNGN()
 	if h.rdb != nil {
 		today := time.Now().UTC().Format("2006-01-02")
-		dailyKey := fmt.Sprintf("yc:daily:deposit:%s:%s", userID, today)
+		dailyKey := fmt.Sprintf("yc:daily:deposit:%s:%s:%s", userID, currency, today)
 		currentDaily, _ := h.rdb.Get(ctx, dailyKey).Float64()
-		if currentDaily+req.AmountNGN > dailyCap {
-			response.BadRequest(c, fmt.Sprintf("deposit amount exceeds daily limit of %.2f NGN (current total: %.2f NGN)", dailyCap, currentDaily))
+		if currentDaily+req.AmountNGN > caps.DailyDepositCap {
+			response.BadRequest(c, fmt.Sprintf("deposit amount exceeds daily limit of %.2f %s (current total: %.2f %s)", caps.DailyDepositCap, currency, currentDaily, currency))
 			return
 		}
 	}
@@ -182,7 +271,7 @@ func (h *DepositHandler) InitiateDeposit(c *gin.Context) {
 	userWallet := wallets[0]
 
 	// Get quote
-	quote, err := h.yc.GetQuote("NGN", "USDC", req.AmountNGN)
+	quote, err := h.rateProvider.GetQuote(ctx, currency, "USDC", req.AmountNGN)
 	if err != nil {
 		response.InternalError(c, "failed to get quote: "+err.Error())
 		return
@@ -192,7 +281,7 @@ func (h *DepositHandler) InitiateDeposit(c *gin.Context) {
 	paymentRef := fmt.Sprintf("MOIST-%d", time.Now().UnixMilli())
 	receive, err := h.yc.CreateReceive(yellowcard.ReceiveRequest{
 		Amount:              req.AmountNGN,
-		Currency:            "NGN",
+		Currency:            currency,
 		DestinationCurrency: "USDC",
 		DestinationAddress:  userWallet.PublicKey,
 		PaymentReference:    paymentRef,
@@ -241,6 +330,7 @@ func (h *DepositHandler) InitiateDeposit(c *gin.Context) {
 		"deposit": gin.H{
 			"receiveId":     receive.ReceiveID,
 			"paymentRef":    paymentRef,
+			"currency":      currency,
 			"bankDetails":   receive.BankDetails,
 			"estimatedUsdc": quote.ToAmount,
 			"spread":        quote.FeePercentage,
@@ -251,12 +341,12 @@ func (h *DepositHandler) InitiateDeposit(c *gin.Context) {
 	// Update daily total and cache idempotency
 	if h.rdb != nil {
 		today := time.Now().UTC().Format("2006-01-02")
-		dailyKey := fmt.Sprintf("yc:daily:deposit:%s:%s", userID, today)
+		dailyKey := fmt.Sprintf("yc:daily:deposit:%s:%s:%s", userID, currency, today)
 		h.rdb.IncrByFloat(ctx, dailyKey, req.AmountNGN)
 		h.rdb.Expire(ctx, dailyKey, 48*time.Hour)
 
 		if idempotencyKey != "" {
-			cachedKey := fmt.Sprintf("yc:idempotency:deposit:%s:%s", userID, idempotencyKey)
+			cachedKey := fmt.Sprintf("yc:idempotency:deposit:%s:%s:%s", userID, currency, idempotencyKey)
 			if payload, err := json.Marshal(respData); err == nil {
 				h.rdb.Set(ctx, cachedKey, payload, 24*time.Hour)
 			}
@@ -266,6 +356,9 @@ func (h *DepositHandler) InitiateDeposit(c *gin.Context) {
 	response.Created(c, respData)
 }
 
+// InitiateWithdraw creates a withdrawal request (USDC → <currency>).
+// currency defaults to NGN and, like InitiateDeposit, needs an entry in
+// config.YellowCardConfig.CurrencyCaps (or to be NGN) to be accepted.
 // POST /v1/wallet/withdraw
 func (h *DepositHandler) InitiateWithdraw(c *gin.Context) {
 	userID := middleware.GetUserID(c)
@@ -278,6 +371,7 @@ func (h *DepositHandler) InitiateWithdraw(c *gin.Context) {
 
 	var req struct {
 		AmountUSDC     float64 `json:"amountUsdc" binding:"required,gt=0"`
+		Currency       string  `json:"currency"`
 		BankCode       string  `json:"bankCode" binding:"required"`
 		AccountNumber  string  `json:"accountNumber" binding:"required"`
 		AccountName    string  `json:"accountName" binding:"required"`
@@ -288,12 +382,23 @@ func (h *DepositHandler) InitiateWithdraw(c *gin.Context) {
 		return
 	}
 
+	currency, errMsg := resolveCurrency(req.Currency)
+	if errMsg != "" {
+		response.BadRequest(c, errMsg)
+		return
+	}
+	caps, capsOK := h.currencyCaps(currency)
+	if !capsOK {
+		response.BadRequest(c, fmt.Sprintf("withdrawals are not yet enabled for currency %q", currency))
+		return
+	}
+
 	idempotencyKey := getIdempotencyKey(c, req.IdempotencyKey)
 	ctx := c.Request.Context()
 
 	// Check idempotency cache in Redis
 	if idempotencyKey != "" && h.rdb != nil {
-		cachedKey := fmt.Sprintf("yc:idempotency:withdraw:%s:%s", userID, idempotencyKey)
+		cachedKey := fmt.Sprintf("yc:idempotency:withdraw:%s:%s:%s", userID, currency, idempotencyKey)
 		cachedData, err := h.rdb.Get(ctx, cachedKey).Bytes()
 		if err == nil && len(cachedData) > 0 {
 			var cachedResp gin.H
@@ -305,20 +410,18 @@ func (h *DepositHandler) InitiateWithdraw(c *gin.Context) {
 	}
 
 	// Validate per-transaction amount cap
-	maxWithdraw := h.maxWithdrawUSDC()
-	if req.AmountUSDC > maxWithdraw {
-		response.BadRequest(c, fmt.Sprintf("withdrawal amount exceeds maximum allowed limit of %.2f USDC", maxWithdraw))
+	if req.AmountUSDC > caps.MaxWithdraw {
+		response.BadRequest(c, fmt.Sprintf("withdrawal amount exceeds maximum allowed limit of %.2f USDC", caps.MaxWithdraw))
 		return
 	}
 
 	// Validate daily amount cap
-	dailyCap := h.dailyWithdrawCapUSDC()
 	if h.rdb != nil {
 		today := time.Now().UTC().Format("2006-01-02")
-		dailyKey := fmt.Sprintf("yc:daily:withdraw:%s:%s", userID, today)
+		dailyKey := fmt.Sprintf("yc:daily:withdraw:%s:%s:%s", userID, currency, today)
 		currentDaily, _ := h.rdb.Get(ctx, dailyKey).Float64()
-		if currentDaily+req.AmountUSDC > dailyCap {
-			response.BadRequest(c, fmt.Sprintf("withdrawal amount exceeds daily limit of %.2f USDC (current total: %.2f USDC)", dailyCap, currentDaily))
+		if currentDaily+req.AmountUSDC > caps.DailyWithdrawCap {
+			response.BadRequest(c, fmt.Sprintf("withdrawal amount exceeds daily limit of %.2f USDC (current total: %.2f USDC)", caps.DailyWithdrawCap, currentDaily))
 			return
 		}
 	}
@@ -332,7 +435,7 @@ func (h *DepositHandler) InitiateWithdraw(c *gin.Context) {
 	userWallet := wallets[0]
 
 	// Get quote
-	quote, err := h.yc.GetQuote("USDC", "NGN", req.AmountUSDC)
+	quote, err := h.rateProvider.GetQuote(ctx, "USDC", currency, req.AmountUSDC)
 	if err != nil {
 		response.InternalError(c, "failed to get quote: "+err.Error())
 		return
@@ -343,7 +446,7 @@ func (h *DepositHandler) InitiateWithdraw(c *gin.Context) {
 	sendResp, err := h.yc.CreateSend(yellowcard.SendRequest{
 		Amount:         req.AmountUSDC,
 		Currency:       "USDC",
-		TargetCurrency: "NGN",
+		TargetCurrency: currency,
 		BankCode:       req.BankCode,
 		AccountNumber:  req.AccountNumber,
 		AccountName:    req.AccountName,
@@ -396,6 +499,7 @@ func (h *DepositHandler) InitiateWithdraw(c *gin.Context) {
 			"sendId":            sendResp.SendID,
 			"status":            sendResp.Status,
 			"paymentRef":        paymentRef,
+			"currency":          currency,
 			"estimatedNgn":      quote.ToAmount,
 			"spread":            quote.FeePercentage,
 			"yellowCardAddress": ycAddress,
@@ -407,12 +511,12 @@ func (h *DepositHandler) InitiateWithdraw(c *gin.Context) {
 	// Update daily total and cache idempotency
 	if h.rdb != nil {
 		today := time.Now().UTC().Format("2006-01-02")
-		dailyKey := fmt.Sprintf("yc:daily:withdraw:%s:%s", userID, today)
+		dailyKey := fmt.Sprintf("yc:daily:withdraw:%s:%s:%s", userID, currency, today)
 		h.rdb.IncrByFloat(ctx, dailyKey, req.AmountUSDC)
 		h.rdb.Expire(ctx, dailyKey, 48*time.Hour)
 
 		if idempotencyKey != "" {
-			cachedKey := fmt.Sprintf("yc:idempotency:withdraw:%s:%s", userID, idempotencyKey)
+			cachedKey := fmt.Sprintf("yc:idempotency:withdraw:%s:%s:%s", userID, currency, idempotencyKey)
 			if payload, err := json.Marshal(respData); err == nil {
 				h.rdb.Set(ctx, cachedKey, payload, 24*time.Hour)
 			}

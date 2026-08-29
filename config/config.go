@@ -103,6 +103,26 @@ type YellowCardConfig struct {
 	MaxWithdrawUSDC      float64 `mapstructure:"max_withdraw_usdc"`
 	DailyDepositCapNGN   float64 `mapstructure:"daily_deposit_cap_ngn"`
 	DailyWithdrawCapUSDC float64 `mapstructure:"daily_withdraw_cap_usdc"`
+	// CurrencyCaps holds per-transaction/daily transfer caps for fiat
+	// currencies beyond the legacy NGN fields above (issue #189). NGN
+	// keeps using the fields above for backward compatibility unless an
+	// explicit "NGN" entry is also present here, in which case the entry
+	// takes precedence. A currency with no entry here (and that isn't NGN)
+	// can still be quoted via the pricing endpoint but deposits/withdrawals
+	// for it are rejected, since moving real money in a new corridor
+	// without deliberately configured caps is a business decision, not a
+	// default.
+	CurrencyCaps map[string]CurrencyCaps `mapstructure:"currency_caps"`
+}
+
+// CurrencyCaps are the per-transaction and daily transfer limits for one
+// fiat currency corridor. MaxDeposit/DailyDepositCap are denominated in the
+// fiat currency; MaxWithdraw/DailyWithdrawCap are denominated in USDC.
+type CurrencyCaps struct {
+	MaxDeposit       float64 `mapstructure:"max_deposit"`
+	MaxWithdraw      float64 `mapstructure:"max_withdraw"`
+	DailyDepositCap  float64 `mapstructure:"daily_deposit_cap"`
+	DailyWithdrawCap float64 `mapstructure:"daily_withdraw_cap"`
 }
 
 // MobileMoneyConfig holds credentials for the mobile-money bridge (#190,
