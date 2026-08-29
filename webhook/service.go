@@ -19,16 +19,16 @@ import (
 )
 
 type WebhookRegistration struct {
-	ID        string    `json:"id"`
-	UserID    string    `json:"user_id"`
-	TargetURL string    `json:"target_url"`
+	ID        string `json:"id"`
+	UserID    string `json:"user_id"`
+	TargetURL string `json:"target_url"`
 	// Secret is kept in-memory only and not returned in API responses or persisted.
-	Secret    string    `json:"-"`
+	Secret string `json:"-"`
 	// SecretHash stores the SHA256 hex of the secret and is persisted.
-	SecretHash string   `json:"secret_hash"`
-	Events    []string  `json:"events"`
-	IsActive  bool      `json:"is_active"`
-	CreatedAt time.Time `json:"created_at"`
+	SecretHash string    `json:"secret_hash"`
+	Events     []string  `json:"events"`
+	IsActive   bool      `json:"is_active"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 type DeliveryLog struct {
@@ -155,11 +155,11 @@ type JobEnqueuer interface {
 
 // WebhookRetryPayload is the serializable payload stored in the persistent job queue for retries.
 type WebhookRetryPayload struct {
-	WebhookID string          `json:"webhook_id"`
-	TargetURL string          `json:"target_url"`
-	SecretHash string        `json:"secret_hash"`
-	Payload   json.RawMessage `json:"payload"`
-	RequestID string          `json:"request_id,omitempty"`
+	WebhookID  string          `json:"webhook_id"`
+	TargetURL  string          `json:"target_url"`
+	SecretHash string          `json:"secret_hash"`
+	Payload    json.RawMessage `json:"payload"`
+	RequestID  string          `json:"request_id,omitempty"`
 }
 
 type Dispatcher struct {
@@ -288,11 +288,11 @@ func (d *Dispatcher) deliverWithRetry(ctx context.Context, wh WebhookRegistratio
 	// If persistent job queue is configured and retries are requested, persist retry job to DB
 	if d.jobQueue != nil && maxRetries > 1 {
 		retryPayload := WebhookRetryPayload{
-			WebhookID: wh.ID,
-			TargetURL: wh.TargetURL,
+			WebhookID:  wh.ID,
+			TargetURL:  wh.TargetURL,
 			SecretHash: wh.SecretHash,
-			Payload:   body,
-			RequestID: reqID,
+			Payload:    body,
+			RequestID:  reqID,
 		}
 		_, enqueueErr := d.jobQueue.Enqueue(ctx, WebhookQueueName, retryPayload, maxRetries)
 		if enqueueErr == nil {
