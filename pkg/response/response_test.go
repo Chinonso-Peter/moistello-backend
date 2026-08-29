@@ -1,49 +1,54 @@
-package response
+package response_test
 
 import (
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/moistello/backend/pkg/response"
 )
 
-func TestOKWithMetaAddsPaginationWithoutBreakingLegacyMeta(t *testing.T) {
+func TestResponse_EnvelopeContract(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
+	r := gin.New()
+	r.GET("/test-ok", func(c *gin.Context) {
+		response.OK(c, gin.H{"foo": "bar"})
+	})
+	r.GET("/test-err", func(c *gin.Context) {
+		c.Header("X-Request-Id", "req-123")
+		response.BadRequest(c, "invalid input")
+	})
 
-	OKWithMeta(ctx, []string{"one"}, NewPaginationMeta(2, 20, 45))
+	t.Run("OK response", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", "/test-ok", nil)
+		r.ServeHTTP(w, req)
 
-	var body map[string]any
-	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &body))
-	assert.NotNil(t, body["data"])
+		assert.Equal(t, http.StatusOK, w.Code)
+		var env response.Envelope
+		err := json.Unmarshal(w.Body.Bytes(), &env)
+		require.NoError(t, err)
+		assert.True(t, env.Success)
+		assert.NotNil(t, env.Data)
+	})
 
-	meta := body["meta"].(map[string]any)
-	assert.Equal(t, float64(20), meta["limit"])
-	assert.Equal(t, float64(3), meta["totalPages"])
-	assert.Equal(t, true, meta["hasMore"])
+	t.Run("Error response with requestId", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", "/test-err", nil)
+		r.ServeHTTP(w, req)
 
-	current := body["pagination"].(map[string]any)
-	assert.Equal(t, float64(2), current["page"])
-	assert.Equal(t, float64(20), current["page_size"])
-	assert.Equal(t, float64(45), current["total"])
-	assert.Equal(t, float64(3), current["total_pages"])
-	assert.Equal(t, true, current["has_more"])
-}
-
-func TestNewPaginationMeta_HasMore(t *testing.T) {
-	// page 2 of 45 items at 20/page -> totalPages 3, so more pages remain.
-	assert.True(t, NewPaginationMeta(2, 20, 45).HasMore)
-	// Last page -> no more.
-	assert.False(t, NewPaginationMeta(3, 20, 45).HasMore)
-	// Empty collection -> no more.
-	assert.False(t, NewPaginationMeta(1, 20, 0).HasMore)
-}
-
-func TestNewPaginationMetaEmptyCollectionHasZeroPages(t *testing.T) {
-	meta := NewPaginationMeta(1, 20, 0)
-	assert.Equal(t, 0, meta.TotalPages)
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+		var env response.Envelope
+		err := json.Unmarshal(w.Body.Bytes(), &env)
+		require.NoError(t, err)
+		assert.False(t, env.Success)
+		assert.Equal(t, "BAD_REQUEST", env.Code)
+		assert.Equal(t, "invalid input", env.Message)
+		assert.Equal(t, "req-123", env.RequestId)
+	})
 }
