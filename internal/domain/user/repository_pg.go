@@ -12,7 +12,6 @@ import (
 	"github.com/moistello/backend/pkg/apperrors"
 )
 
-
 type pgRepo struct {
 	db *sqlx.DB
 }
