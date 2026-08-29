@@ -10,6 +10,7 @@ import (
 
 type Repository interface {
 	GetBalance(ctx context.Context) (*TreasuryBalance, error)
+	CreateTransaction(ctx context.Context, tx *TreasuryTransaction) error
 	CreateWithdrawalRequest(ctx context.Context, req *WithdrawalRequest) error
 	GetWithdrawalRequest(ctx context.Context, id string) (*WithdrawalRequest, error)
 	ListWithdrawalRequests(ctx context.Context, status WithdrawalStatus, limit int) ([]WithdrawalRequest, error)
