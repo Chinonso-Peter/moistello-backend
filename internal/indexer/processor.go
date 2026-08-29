@@ -582,11 +582,11 @@ func (p *EventProcessor) onDefaultRecorded(ctx context.Context, ev *ContractEven
 		Msg("DefaultRecorded: reputation penalty applied")
 
 	p.Broadcast(ctx, contractID, "reputation.updated", map[string]any{
-		"user_id":      u.ID.String(),
-		"new_score":    newScore,
-		"level":        level,
-		"reason":       "default",
-		"tx_hash":      ev.TxHash,
+		"user_id":   u.ID.String(),
+		"new_score": newScore,
+		"level":     level,
+		"reason":    "default",
+		"tx_hash":   ev.TxHash,
 	})
 	return nil
 }
