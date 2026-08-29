@@ -24,14 +24,14 @@ type Publisher interface {
 // It carries everything the queue consumer needs to sign and POST the payload
 // without touching the database again.
 type Message struct {
-	RegistrationID string          `json:"registrationId"`
-	UserID         string          `json:"userId,omitempty"`
-	TargetURL      string          `json:"targetUrl"`
+	RegistrationID string `json:"registrationId"`
+	UserID         string `json:"userId,omitempty"`
+	TargetURL      string `json:"targetUrl"`
 	// Secret contains either the raw secret (if available in-memory) or the stored secret hash.
-	Secret         string          `json:"secret"`
-	Payload        json.RawMessage `json:"payload"`
-	RequestID      string          `json:"requestId,omitempty"`
-	MaxRetries     int             `json:"maxRetries"`
+	Secret     string          `json:"secret"`
+	Payload    json.RawMessage `json:"payload"`
+	RequestID  string          `json:"requestId,omitempty"`
+	MaxRetries int             `json:"maxRetries"`
 }
 
 // Deliver POSTs the message payload to the registered target with an

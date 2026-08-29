@@ -64,8 +64,6 @@ func testUser(wallet string) *user.User {
 	}
 }
 
-
-
 func contractEvent(eventType, contractID string, payload map[string]any) *ContractEvent {
 	return &ContractEvent{
 		ContractID: contractID,

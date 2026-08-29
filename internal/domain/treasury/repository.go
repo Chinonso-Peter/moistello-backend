@@ -10,6 +10,7 @@ import (
 
 type Repository interface {
 	GetBalance(ctx context.Context) (*TreasuryBalance, error)
+	CreateTransaction(ctx context.Context, tx *TreasuryTransaction) error
 	CreateWithdrawalRequest(ctx context.Context, req *WithdrawalRequest) error
 	GetWithdrawalRequest(ctx context.Context, id string) (*WithdrawalRequest, error)
 	ListWithdrawalRequests(ctx context.Context, status WithdrawalStatus, limit int) ([]WithdrawalRequest, error)
@@ -120,6 +121,19 @@ func (r *pgRepo) ListTransactions(ctx context.Context, limit int, offset int) ([
 		return nil, fmt.Errorf("listing treasury transactions: %w", err)
 	}
 	return transactions, nil
+}
+
+func (r *pgRepo) CreateTransaction(ctx context.Context, tx *TreasuryTransaction) error {
+	query := `
+		INSERT INTO treasury_transactions (id, type, asset, amount, from_address, to_address, tx_hash, description, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+	`
+	_, err := r.db.ExecContext(ctx, query,
+		tx.ID, tx.Type, tx.Asset, tx.Amount, tx.From, tx.To, tx.TxHash, tx.Description, tx.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("creating treasury transaction: %w", err)
+	}
+	return nil
 }
 
 func (r *pgRepo) CountTransactions(ctx context.Context) (int, error) {

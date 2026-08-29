@@ -78,4 +78,3 @@ func (m *Repository) ClaimNextName(ctx context.Context) (int64, error) {
 	args := m.Called(ctx)
 	return args.Get(0).(int64), args.Error(1)
 }
-
