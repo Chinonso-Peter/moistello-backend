@@ -13,7 +13,7 @@ func TestOptionsValidate(t *testing.T) {
 		{"up all", Options{Direction: DirectionUp}, false},
 		{"down one", Options{Direction: DirectionDown}, false},
 		{"bad direction", Options{Direction: "sideways"}, true},
-		{"to with up", Options{Direction: DirectionUp, To: "035_create_swap_offers"}, false},
+		{"to with up", Options{Direction: DirectionUp, To: "042_create_swap_offers"}, false},
 		{"count with down", Options{Direction: DirectionDown, Count: 3}, false},
 		{"to and count", Options{Direction: DirectionUp, To: "001_create_users", Count: 2}, true},
 		{"negative count", Options{Direction: DirectionUp, Count: -1}, true},
@@ -79,8 +79,8 @@ func TestListMigrationFilesEmbedded(t *testing.T) {
 			t.Logf("note: numeric prefix %s shared by %d migrations (must stay distinct)", prefix, n)
 		}
 	}
-	if prefixCount["016"] < 2 || prefixCount["035"] < 2 {
-		t.Fatalf("expected duplicate prefixes 016/035 in test fixtures, got %#v", prefixCount)
+	if prefixCount["016"] < 2 || prefixCount["031"] < 2 {
+		t.Fatalf("expected duplicate prefixes 016/031 in test fixtures, got %#v", prefixCount)
 	}
 }
 

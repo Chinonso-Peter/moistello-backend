@@ -66,7 +66,7 @@ var barePrefixRe = regexp.MustCompile(`^\d+$`)
 //
 // The full filename stem is used as the identity of a migration so that
 // migrations sharing a numeric prefix (016_email_verifications vs
-// 016_widen_wallet_address, 035_create_governance vs 035_create_swap_offers)
+// 016_widen_wallet_address, 035_create_governance vs 042_create_swap_offers)
 // remain distinct, trackable versions instead of colliding inside
 // schema_migrations.
 func versionFromPath(path string) string {
