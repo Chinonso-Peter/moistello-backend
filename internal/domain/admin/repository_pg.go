@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jmoiron/sqlx"
 )
@@ -16,6 +17,9 @@ func NewRepository(db *sqlx.DB) Repository {
 }
 
 func (r *pgRepo) Metrics(ctx context.Context, days int) (*Metrics, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
 	if days < 1 {
 		days = 30
 	}
@@ -72,6 +76,9 @@ func (r *pgRepo) Metrics(ctx context.Context, days int) (*Metrics, error) {
 }
 
 func (r *pgRepo) DailyVolume(ctx context.Context, days int) ([]DailyVolumePoint, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
 	if days < 1 {
 		days = 30
 	}
