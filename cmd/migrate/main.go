@@ -16,7 +16,7 @@ func main() {
 		"With -direction up: apply pending migrations through the target.\n"+
 		"With -direction down: revert applied migrations above the target (target stays applied).")
 	count := flag.Int("count", 0, "Limit how many migrations to apply (up) or revert (down).\n"+
-		"Defaults: apply all pending on up, revert a single step on down.")
+		"Defaults: apply all pending on up, revert all on down.")
 	flag.Parse()
 
 	opts := Options{Direction: *direction, To: *to, Count: *count}

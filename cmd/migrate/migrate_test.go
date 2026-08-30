@@ -229,13 +229,13 @@ func TestSelectDownFiles(t *testing.T) {
 	}
 	allApplied := map[string]bool{"001_a": true, "002_b": true, "003_c": true, "004_d": true}
 
-	t.Run("default reverts exactly one step, newest first", func(t *testing.T) {
+	t.Run("default reverts all applied, newest first", func(t *testing.T) {
 		got, err := selectDownFiles(files, order, allApplied, Options{Direction: DirectionDown})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(got) != 1 || got[0] != "migrations/004_d.down.sql" {
-			t.Fatalf("default down should revert newest single migration, got %v", got)
+		if len(got) != 4 || got[0] != "migrations/004_d.down.sql" {
+			t.Fatalf("default down should revert all applied, got %v", got)
 		}
 	})
 
