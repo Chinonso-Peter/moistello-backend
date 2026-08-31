@@ -14,11 +14,11 @@ type Service interface {
 }
 
 type Claims struct {
-	UserID      string `json:"sub"`
-	Wallet      string `json:"wallet"`
-	Role        string `json:"role"`
-	IssuedAt    int64  `json:"iat"`
-	ExpiresAt   int64  `json:"exp"`
+	UserID    string `json:"sub"`
+	Wallet    string `json:"wallet"`
+	Role      string `json:"role"`
+	IssuedAt  int64  `json:"iat"`
+	ExpiresAt int64  `json:"exp"`
 }
 
 type service struct {
@@ -70,12 +70,14 @@ func (s *service) ValidateToken(ctx context.Context, tokenString string) (*Claim
 		userID, _ := claims["sub"].(string)
 		wallet, _ := claims["wallet"].(string)
 		role, _ := claims["role"].(string)
+		iat, _ := claims["iat"].(float64)
+		exp, _ := claims["exp"].(float64)
 		return &Claims{
 			UserID:    userID,
 			Wallet:    wallet,
 			Role:      role,
-			IssuedAt:  int64(claims["iat"].(float64)),
-			ExpiresAt: int64(claims["exp"].(float64)),
+			IssuedAt:  int64(iat),
+			ExpiresAt: int64(exp),
 		}, nil
 	}
 
