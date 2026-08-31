@@ -156,7 +156,11 @@ func main() {
 	_ = ws.NewRedisBridge(wsHub, redisClient)
 
 	userSvc := user.NewService(userRepo, circleRepo)
-	circleSvc := circle.NewService(circleRepo, &moiAdapter{repo: userRepo}, &communityAdapter{repo: communityRepo}, wsBroadcaster, circle.NewTransactor(db))
+	circleSvc := circle.NewService(circleRepo, &moiAdapter{repo: userRepo}, circle.Dependencies{
+		CommunityChecker: &communityAdapter{repo: communityRepo},
+		Broadcaster:      wsBroadcaster,
+		Transactor:       circle.NewTransactor(db),
+	})
 	// Stellar client used for on-chain verification
 	horizonClient := stellar.NewClient(cfg.Stellar.HorizonURL, cfg.Stellar.SorobanRPCURL, cfg.Stellar.NetworkPassphrase)
 

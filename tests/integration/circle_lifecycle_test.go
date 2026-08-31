@@ -25,7 +25,7 @@ func TestCircleLifecycle(t *testing.T) {
 	payoutRepo := new(payoutMocks.Repository)
 
 	userSvc := user.NewService(userRepo, nil)
-	circleSvc := circle.NewService(circleRepo, nil)
+	circleSvc := circle.NewService(circleRepo, nil, circle.Dependencies{})
 	contribSvc := contribution.NewService(contribRepo, nil, nil, nil, "")
 	payoutSvc := payout.NewService(payoutRepo, nil, nil)
 
@@ -140,7 +140,7 @@ func TestCircleLifecycle(t *testing.T) {
 
 func TestCircleLifecycle_FullCircle(t *testing.T) {
 	circleRepo := new(circleMocks.Repository)
-	circleSvc := circle.NewService(circleRepo, nil)
+	circleSvc := circle.NewService(circleRepo, nil, circle.Dependencies{})
 
 	org := helpers.NewTestUser("GORGFULL1234567890ABCDEF1234567890ABCDEF")
 	m1 := helpers.NewTestUser("GM1FULL1234567890ABCDEF1234567890ABCDEF")
