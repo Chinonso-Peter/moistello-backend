@@ -73,11 +73,16 @@ func NewRouter(
 	r.Use(middleware.RateLimitMiddleware(redisClient, cfg.RateLimit))
 
 	r.GET("/health", healthHandler.Health)
-	r.GET("/health/ready", healthHandler.Ready)
+	r.GET("/health/ready", healthHandler.Readiness)
+	r.GET("/health/live", healthHandler.Liveness)
 
 	swaggerH := handler.NewSwaggerHandler()
 	r.GET("/api-docs", swaggerH.ServeUI)
 	r.GET("/api-docs/openapi.json", swaggerH.ServeJSON)
+
+	// Public webhooks (idempotency-keyed internally)
+	r.POST("/webhooks/incoming/:id", handler.NewIncomingWebhookHandler(webhookRepo).ReceiveWebhook)
+	r.POST("/webhooks/yellowcard", yellowCardWebhookHandler.HandleWebhook)
 
 	// WebSocket — real-time events
 	wsRoute := r.Group("")
@@ -95,13 +100,9 @@ func NewRouter(
 		{
 			auth.POST("/register", perResource(redisClient, "otp", cfg.RateLimit.OTPLimit, cfg.RateLimit.OTPWindowSeconds), authHandler.Register)
 			auth.POST("/register/verify", perResource(redisClient, "otp", cfg.RateLimit.OTPLimit, cfg.RateLimit.OTPWindowSeconds), authHandler.RegisterVerify)
-			auth.POST("/login", authHandler.Login)
 			auth.POST("/refresh", middleware.RefreshTokenBlocklistMiddleware(redisClient), authHandler.Refresh)
 			auth.POST("/nonce", authHandler.Nonce)
 			auth.POST("/verify", authHandler.Verify)
-			auth.POST("/passkey/nonce", authHandler.PasskeyNonce)
-			auth.POST("/passkey/verify", authHandler.PasskeyVerify)
-			auth.POST("/recovery", authHandler.Recovery)
 		}
 
 		authenticated := api.Group("")
@@ -115,24 +116,16 @@ func NewRouter(
 		{
 			authenticated.GET("/me", authHandler.Me)
 			authenticated.POST("/auth/logout", authHandler.Logout)
-			authenticated.POST("/auth/wallet/init", authHandler.InitWallet)
-			authenticated.POST("/auth/passkey/link", authHandler.PasskeyLink)
-			authenticated.GET("/sessions", authHandler.ListSessions)
-			authenticated.DELETE("/sessions/:id", authHandler.RevokeSession)
-			authenticated.DELETE("/sessions", authHandler.RevokeAllSessions)
-			authenticated.POST("/auth/totp/setup", authHandler.SetupTOTP)
-			authenticated.POST("/auth/totp/verify", authHandler.VerifyTOTPSetup)
+			authenticated.DELETE("/sessions/:id", authHandler.RevokeSessionByID)
 
-			authenticated.GET("/users/me", userHandler.GetMe)
-			authenticated.PATCH("/users/me", userHandler.UpdateMe)
-			authenticated.DELETE("/users/me", userHandler.DeleteUser)
-			authenticated.GET("/users/me/reputation", userHandler.GetReputation)
-			authenticated.GET("/users/me/circles", userHandler.GetMyCircles)
-			authenticated.POST("/users/me/kyc", userHandler.SubmitKYC)
-			authenticated.GET("/users/me/kyc/status", userHandler.GetKYCStatus)
+			authenticated.POST("/users/username/claim", userHandler.ClaimName)
 
 			// Public — claim a unique anonymous name (before auth)
 			api.POST("/claim-name", userHandler.ClaimName)
+
+			// Passkey credential store/retrieval
+			authenticated.POST("/credential", passkeyCredentialHandler.StoreCredential)
+			authenticated.GET("/credential", passkeyCredentialHandler.GetCredential)
 
 			// Wallet routes
 			authenticated.POST("/wallets", walletHandler.CreateWallet)
@@ -206,6 +199,7 @@ func NewRouter(
 			authenticated.POST("/communities", communityHandler.Create)
 			authenticated.GET("/communities", communityHandler.List)
 			authenticated.GET("/communities/:id", communityHandler.Get)
+			authenticated.GET("/communities/slug/:slug", communityHandler.GetBySlug)
 			authenticated.PATCH("/communities/:id", communityHandler.Update)
 			authenticated.DELETE("/communities/:id", communityHandler.Delete)
 			authenticated.POST("/communities/:id/join", communityHandler.Join)
@@ -243,6 +237,7 @@ func NewRouter(
 			authenticated.POST("/token/stake", tokenHandler.Stake)
 			authenticated.POST("/token/unstake", tokenHandler.Unstake)
 			authenticated.GET("/token/stakes/:address", tokenHandler.GetStakes)
+
 			// Swap endpoints
 			authenticated.POST("/swap/offer", perResource(redisClient, "swap", cfg.RateLimit.SwapLimit, cfg.RateLimit.SwapWindowSeconds), swapHandler.CreateSwapOffer)
 			authenticated.POST("/swap/accept", perResource(redisClient, "swap", cfg.RateLimit.SwapLimit, cfg.RateLimit.SwapWindowSeconds), swapHandler.AcceptSwapOffer)
@@ -251,11 +246,9 @@ func NewRouter(
 
 			authenticated.POST("/webhooks", webhookHandler.RegisterWebhook)
 			authenticated.GET("/webhooks", webhookHandler.ListWebhooks)
+			authenticated.GET("/webhooks/deliveries", webhookHandler.ListDeliveries)
 			authenticated.DELETE("/webhooks/:id", webhookHandler.DeleteWebhook)
 		}
-
-		incomingWebhookH := handler.NewIncomingWebhookHandler(webhookRepo)
-		r.POST("/webhooks/incoming/:id", incomingWebhookH.ReceiveWebhook)
 
 		admin := authenticated.Group("/admin")
 		admin.Use(middleware.AdminMiddleware())
@@ -276,11 +269,10 @@ func NewRouter(
 		optional.Use(middleware.OptionalAuthMiddleware(jwtPublicKey))
 		{
 			optional.GET("/circles", circleHandler.ListCircles)
-			optional.GET("/users/:id", userHandler.GetByID)
 
 			// GDPR cookie consent — works for both authenticated and anonymous users
-			optional.POST("/consent", consentHandler.SaveConsent)
 			optional.GET("/consent", consentHandler.GetConsent)
+			optional.POST("/consent", consentHandler.SaveConsent)
 		}
 	}
 

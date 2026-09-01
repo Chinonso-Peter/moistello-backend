@@ -1,192 +1,31 @@
 package handler
 
 import (
-	"net/http"
-	"strings"
-
 	"github.com/gin-gonic/gin"
-	"github.com/moistello/backend/internal/api/middleware"
 	"github.com/moistello/backend/internal/domain/user"
 	"github.com/moistello/backend/pkg/response"
-	"github.com/redis/go-redis/v9"
 )
 
 type UserHandler struct {
 	userService user.Service
-	redisClient *redis.Client
 }
 
-type publicUserProfile struct {
-	PublicKey   string  `json:"publicKey"`
-	DisplayName *string `json:"displayName,omitempty"`
-	MoiScore    int     `json:"moiScore"`
+func NewUserHandler(userService user.Service) *UserHandler {
+	return &UserHandler{userService: userService}
 }
 
-func NewUserHandler(svc user.Service, redisClient *redis.Client) *UserHandler {
-	return &UserHandler{userService: svc, redisClient: redisClient}
-}
-
-// @Summary Get my profile
-// @Description Returns the authenticated user's public profile.
-// @Tags Users
+// @Summary Claim username
+// @Description Claims a username/handle for the authenticated user (RESTful: POST /v1/users/username/claim)
+// @Tags User
 // @Produce json
 // @Security BearerAuth
-// @Success 200 {object} response.Envelope{data=object{user=object}}
-// @Failure 404 {object} response.Envelope
-// @Router /users/me [get]
-func (h *UserHandler) GetMe(c *gin.Context) {
-	userID := middleware.GetUserID(c)
-	u, err := h.userService.GetByID(c.Request.Context(), userID)
-	if err != nil {
-		response.NotFound(c, "user not found")
-		return
-	}
-	response.OK(c, gin.H{"user": publicUserProfile{
-		PublicKey:   u.WalletAddress,
-		DisplayName: u.DisplayName,
-		MoiScore:    u.MoiScore,
-	}})
-}
-
-// @Summary Update my profile
-// @Description Updates the authenticated user's profile fields (displayName, email, countryCode, preferredLanguage).
-// @Tags Users
-// @Accept json
-// @Produce json
-// @Security BearerAuth
-// @Param body body user.UpdateProfileInput true "Profile updates"
-// @Success 200 {object} response.Envelope{data=object{user=object}}
-// @Failure 400 {object} response.Envelope
-// @Router /users/me [patch]
-func (h *UserHandler) UpdateMe(c *gin.Context) {
-	userID := middleware.GetUserID(c)
-	var updates user.UpdateProfileInput
-	if err := c.ShouldBindJSON(&updates); err != nil {
-		response.BadRequest(c, err.Error())
-		return
-	}
-	u, err := h.userService.UpdateProfile(c.Request.Context(), userID, updates)
-	if err != nil {
-		response.BadRequest(c, err.Error())
-		return
-	}
-	response.OK(c, gin.H{"user": publicUserProfile{
-		PublicKey:   u.WalletAddress,
-		DisplayName: u.DisplayName,
-		MoiScore:    u.MoiScore,
-	}})
-}
-
-// DeleteUser permanently deletes the authenticated user's account and blocklists all active tokens.
-// DELETE /users/me
-func (h *UserHandler) DeleteUser(c *gin.Context) {
-	userID := middleware.GetUserID(c)
-	if userID == "" {
-		response.Unauthorized(c, "not authenticated")
-		return
-	}
-
-	authHeader := c.GetHeader("Authorization")
-	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
-		response.Unauthorized(c, "missing or invalid token")
-		return
-	}
-	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
-	if expiry, err := middleware.ExtractTokenExpiry(tokenStr); err == nil {
-		middleware.BlocklistToken(c.Request.Context(), h.redisClient, tokenStr, expiry)
-	}
-
-	middleware.BlocklistUserRefreshTokens(c.Request.Context(), h.redisClient, userID)
-
-	if err := h.userService.Delete(c.Request.Context(), userID); err != nil {
-		response.InternalError(c, "failed to delete account: "+err.Error())
-		return
-	}
-
-	response.OK(c, gin.H{"success": true})
-}
-
-// @Summary Get user by ID
-// @Description Returns a user's public profile by wallet address or user ID.
-// @Tags Users
-// @Produce json
-// @Param id path string true "User ID or wallet address"
-// @Success 200 {object} response.Envelope{data=object{user=object}}
-// @Failure 404 {object} response.Envelope
-// @Router /users/{id} [get]
-func (h *UserHandler) GetByID(c *gin.Context) {
-	id := c.Param("id")
-	u, err := h.userService.GetByID(c.Request.Context(), id)
-	if err != nil {
-		response.NotFound(c, "user not found")
-		return
-	}
-	response.OK(c, gin.H{"user": publicUserProfile{
-		PublicKey:   u.WalletAddress,
-		DisplayName: u.DisplayName,
-		MoiScore:    u.MoiScore,
-	}})
-}
-
-// @Summary Get my reputation score
-// @Description Returns the authenticated user's MoiScore reputation.
-// @Tags Users
-// @Produce json
-// @Security BearerAuth
-// @Success 200 {object} response.Envelope{data=object{reputation=number}}
-// @Failure 500 {object} response.Envelope
-// @Router /users/me/reputation [get]
-func (h *UserHandler) GetReputation(c *gin.Context) {
-	userID := middleware.GetUserID(c)
-	score, err := h.userService.GetMoiScore(c.Request.Context(), userID)
-	if err != nil {
-		response.InternalError(c, "failed to get reputation score")
-		return
-	}
-	response.OK(c, gin.H{"reputation": score})
-}
-
-// @Summary Get my circles
-// @Description Returns all circles the authenticated user belongs to.
-// @Tags Users
-// @Produce json
-// @Security BearerAuth
-// @Success 200 {object} response.Envelope{data=object{circles=array}}
-// @Failure 500 {object} response.Envelope
-// @Router /users/me/circles [get]
+// @Success 200 {object} response.Envelope
+// @Router /users/username/claim [post]
 func (h *UserHandler) ClaimName(c *gin.Context) {
-	name, err := h.userService.ClaimName(c.Request.Context())
+	_, err := h.userService.ClaimName(c.Request.Context())
 	if err != nil {
-		response.InternalError(c, "failed to generate name")
+		response.BadRequest(c, err.Error())
 		return
 	}
-	response.OK(c, gin.H{"name": name})
-}
-
-func (h *UserHandler) GetMyCircles(c *gin.Context) {
-	userID := middleware.GetUserID(c)
-	circles, err := h.userService.GetCircles(c.Request.Context(), userID)
-	if err != nil {
-		response.InternalError(c, "failed to get circles")
-		return
-	}
-	response.OK(c, gin.H{"circles": circles})
-}
-
-// @Summary Submit KYC documents
-// @Description Submits KYC documents for identity verification. Not yet implemented.
-// @Tags Users
-// @Security BearerAuth
-// @Router /users/me/kyc [post]
-func (h *UserHandler) SubmitKYC(c *gin.Context) {
-	response.ErrorWithCode(c, http.StatusNotImplemented, "not_implemented", "KYC submission is not yet implemented")
-}
-
-// @Summary Get KYC status
-// @Description Returns the authenticated user's KYC verification status. Not yet implemented.
-// @Tags Users
-// @Security BearerAuth
-// @Router /users/me/kyc/status [get]
-func (h *UserHandler) GetKYCStatus(c *gin.Context) {
-	response.ErrorWithCode(c, http.StatusNotImplemented, "not_implemented", "KYC status is not yet implemented")
+	response.OK(c, gin.H{"success": true, "message": "username claimed successfully"})
 }

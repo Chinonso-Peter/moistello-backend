@@ -19,6 +19,7 @@ import (
 	"github.com/moistello/backend/internal/domain/user"
 	userMocks "github.com/moistello/backend/internal/domain/user/mocks"
 	"github.com/moistello/backend/internal/domain/verification"
+	walletDomain "github.com/moistello/backend/internal/domain/wallet"
 	"github.com/moistello/backend/pkg/apperrors"
 	"github.com/moistello/backend/pkg/validator"
 )
@@ -62,6 +63,7 @@ func newEmailConsistencyEnv(t *testing.T) *emailConsistencyEnv {
 	}, nil)
 
 	wallet.On("DeriveWalletSeed", mock.Anything, mock.AnythingOfType("string")).Return(testWalletSeed, nil)
+	wallet.On("CreateWallet", mock.Anything, mock.AnythingOfType("string"), mock.AnythingOfType("[]uint8")).Return(&walletDomain.Wallet{}, nil)
 
 	env.h = handler.NewAuthHandler(mockAuthSvc, userSvc, wallet, nil, verificationSvc, nil, nil, mockUserRepo)
 	return env
@@ -98,7 +100,6 @@ func TestEmailConsistency_RegisterStoresHashedEmail(t *testing.T) {
 
 	// Step 2 – capture what email value is written to the DB.
 	var storedUser *user.User
-	env.wallet.On("CreateWallet", mock.Anything, mock.AnythingOfType("string"), mock.AnythingOfType("[]uint8")).Return(nil, nil)
 	env.mockUserRepo.On("Create", mock.Anything, mock.AnythingOfType("*user.User")).
 		Run(func(args mock.Arguments) {
 			storedUser = args.Get(1).(*user.User)
