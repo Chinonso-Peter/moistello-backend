@@ -12,11 +12,11 @@ import (
 
 func main() {
 	direction := flag.String("direction", "up", "Migration direction: up or down")
-	to := flag.String("to", "", "Target migration version, e.g. 035_create_swap_offers (or legacy prefix 035 when unambiguous).\n"+
+	to := flag.String("to", "", "Target migration version, e.g. 042_create_swap_offers (or legacy prefix 042 when unambiguous).\n"+
 		"With -direction up: apply pending migrations through the target.\n"+
 		"With -direction down: revert applied migrations above the target (target stays applied).")
 	count := flag.Int("count", 0, "Limit how many migrations to apply (up) or revert (down).\n"+
-		"Defaults: apply all pending on up, revert a single step on down.")
+		"Defaults: apply all pending on up, revert all on down.")
 	flag.Parse()
 
 	opts := Options{Direction: *direction, To: *to, Count: *count}

@@ -156,7 +156,7 @@ func (h *HealthHandler) Liveness(c *gin.Context) {
 }
 
 // @Summary Readiness check
-// @Description Reports readiness status of core dependencies (PostgreSQL, Redis, RabbitMQ).
+// @Description Reports readiness status of core dependencies (PostgreSQL, Redis, RabbitMQ, Stellar RPC, Horizon).
 // @Tags Health
 // @Produce json
 // @Success 200 {object} HealthResponse
@@ -182,6 +182,18 @@ func (h *HealthHandler) Readiness(c *gin.Context) {
 	rabbitmqStatus := h.checkRabbitMQ()
 	deps["rabbitmq"] = rabbitmqStatus
 	if rabbitmqStatus.Status != "healthy" {
+		allHealthy = false
+	}
+
+	stellarRPCStatus := h.checkStellarRPC(timeout)
+	deps["stellar_rpc"] = stellarRPCStatus
+	if stellarRPCStatus.Status != "healthy" {
+		allHealthy = false
+	}
+
+	horizonStatus := h.checkHorizon(timeout)
+	deps["horizon"] = horizonStatus
+	if horizonStatus.Status != "healthy" {
 		allHealthy = false
 	}
 
@@ -278,30 +290,18 @@ func (h *HealthHandler) checkStellarRPC(timeout time.Duration) DependencyStatus 
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode != http.StatusOK {
 		return DependencyStatus{
 			Status:  "unhealthy",
 			Latency: fmt.Sprintf("%v", latency),
-			Message: fmt.Sprintf("received status code %d", resp.StatusCode),
+			Message: fmt.Sprintf("bad status code: %d", resp.StatusCode),
 		}
-	}
-
-	var body struct {
-		Result struct {
-			Status string `json:"status"`
-		} `json:"result"`
-	}
-	_ = json.NewDecoder(resp.Body).Decode(&body)
-
-	msg := "reachable"
-	if body.Result.Status != "" {
-		msg = fmt.Sprintf("status: %s", body.Result.Status)
 	}
 
 	return DependencyStatus{
 		Status:  "healthy",
 		Latency: fmt.Sprintf("%v", latency),
-		Message: msg,
+		Message: "reachable",
 	}
 }
 
@@ -329,11 +329,11 @@ func (h *HealthHandler) checkHorizon(timeout time.Duration) DependencyStatus {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
 		return DependencyStatus{
 			Status:  "unhealthy",
 			Latency: fmt.Sprintf("%v", latency),
-			Message: fmt.Sprintf("received status code %d", resp.StatusCode),
+			Message: fmt.Sprintf("bad status code: %d", resp.StatusCode),
 		}
 	}
 
