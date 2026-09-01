@@ -3,6 +3,7 @@ package audit
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jmoiron/sqlx"
 )
@@ -16,6 +17,9 @@ func NewRepository(db *sqlx.DB) Repository {
 }
 
 func (r *pgRepo) Log(ctx context.Context, entry *AuditEntry) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
 	query := `INSERT INTO audit_log (id, actor_id, action, resource_type, resource_id, details, ip_address, user_agent, created_at)
 		VALUES (:id, :actor_id, :action, :resource_type, :resource_id, :details, :ip_address, :user_agent, :created_at)`
 	_, err := r.db.NamedExecContext(ctx, query, entry)
@@ -26,6 +30,9 @@ func (r *pgRepo) Log(ctx context.Context, entry *AuditEntry) error {
 }
 
 func (r *pgRepo) List(ctx context.Context, page, limit int) ([]AuditEntry, int, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
 	if page < 1 {
 		page = 1
 	}

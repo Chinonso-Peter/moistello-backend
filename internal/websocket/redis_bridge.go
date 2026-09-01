@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"sync"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog/log"
@@ -13,13 +14,58 @@ import (
 // events and relays them to the local Hub. One RedisBridge should be started
 // per API server instance.
 type RedisBridge struct {
-	hub    *Hub
-	rdb    *redis.Client
-	pubsub *redis.PubSub
-	stop   chan struct{}
-	cancel context.CancelFunc
-	once   sync.Once
-	done   chan struct{}
+	hub         *Hub
+	rdb         *redis.Client
+	pubsub      *redis.PubSub
+	stop        chan struct{}
+	cancel      context.CancelFunc
+	once        sync.Once
+	done        chan struct{}
+	queue       chan []byte
+	rateLimiter *BridgeRateLimiter
+}
+
+// BridgeRateLimiter provides per-client rate limiting for websocket bridge relays.
+type BridgeRateLimiter struct {
+	mu       sync.Mutex
+	limits   map[string][]time.Time
+	maxRate  int           // e.g. max messages per window
+	window   time.Duration // e.g. 1 second
+}
+
+func NewBridgeRateLimiter(maxRate int, window time.Duration) *BridgeRateLimiter {
+	return &BridgeRateLimiter{
+		limits:  make(map[string][]time.Time),
+		maxRate: maxRate,
+		window:  window,
+	}
+}
+
+func (rl *BridgeRateLimiter) Allow(key string) bool {
+	if key == "" || rl.maxRate <= 0 {
+		return true
+	}
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := time.Now()
+	cutoff := now.Add(-rl.window)
+
+	var recent []time.Time
+	for _, t := range rl.limits[key] {
+		if t.After(cutoff) {
+			recent = append(recent, t)
+		}
+	}
+
+	if len(recent) >= rl.maxRate {
+		rl.limits[key] = recent
+		return false
+	}
+
+	recent = append(recent, now)
+	rl.limits[key] = recent
+	return true
 }
 
 // NewRedisBridge creates a RedisBridge and starts consuming events from the
@@ -28,14 +74,17 @@ func NewRedisBridge(hub *Hub, rdb *redis.Client) *RedisBridge {
 	ctx, cancel := context.WithCancel(context.Background())
 	pubsub := rdb.Subscribe(ctx, redisChannel)
 	b := &RedisBridge{
-		hub:    hub,
-		rdb:    rdb,
-		pubsub: pubsub,
-		stop:   make(chan struct{}),
-		cancel: cancel,
-		done:   make(chan struct{}),
+		hub:         hub,
+		rdb:         rdb,
+		pubsub:      pubsub,
+		stop:        make(chan struct{}),
+		cancel:      cancel,
+		done:        make(chan struct{}),
+		queue:       make(chan []byte, 1024), // Bounded relay queue with backpressure
+		rateLimiter: NewBridgeRateLimiter(100, time.Second), // Per-client rate limiter default
 	}
 	go b.consume(ctx)
+	go b.processQueue(ctx)
 	return b
 }
 
@@ -73,7 +122,25 @@ func (b *RedisBridge) consume(ctx context.Context) {
 			if !ok {
 				return
 			}
-			b.handleMessage([]byte(msg.Payload))
+			// Apply backpressure via non-blocking channel send or drop policy if full
+			select {
+			case b.queue <- []byte(msg.Payload):
+			default:
+				log.Warn().Msg("redis bridge queue full: dropping incoming pub/sub message (backpressure policy)")
+			}
+		}
+	}
+}
+
+func (b *RedisBridge) processQueue(ctx context.Context) {
+	for {
+		select {
+		case <-b.stop:
+			return
+		case <-ctx.Done():
+			return
+		case data := <-b.queue:
+			b.handleMessage(data)
 		}
 	}
 }
@@ -99,6 +166,20 @@ func (b *RedisBridge) handleMessage(data []byte) {
 	}
 	if err := json.Unmarshal(env.Payload, &pay); err != nil {
 		log.Debug().Err(err).Msg("redis bridge payload unmarshal")
+		return
+	}
+
+	// Apply per-client rate limiting based on recipient (UserID or Room/Circle/Community)
+	limiterKey := pay.UserID
+	if limiterKey == "" {
+		limiterKey = pay.CircleID
+	}
+	if limiterKey == "" {
+		limiterKey = pay.CommunityID
+	}
+
+	if !b.rateLimiter.Allow(limiterKey) {
+		log.Debug().Str("key", limiterKey).Msg("redis bridge rate limit exceeded for target, dropping message")
 		return
 	}
 

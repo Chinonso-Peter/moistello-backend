@@ -4,71 +4,91 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"strconv"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
-
 	"github.com/moistello/backend/pkg/apperrors"
-	"github.com/moistello/backend/pkg/stellar"
+	"github.com/moistello/backend/pkg/metrics"
+	"github.com/rs/zerolog/log"
 )
 
-// Broadcaster defines the interface for real-time event broadcasting
-// of contribution events to WebSocket clients.
+// RecordInput carries all fields needed to record a contribution.
+type RecordInput struct {
+	CircleID    string
+	UserID      string
+	RoundNumber int
+	Amount      float64
+	TxnHash     string
+	// Optional overrides — used by the indexer / tests to set verification
+	// state directly without going through the Horizon check.
+	VerifiedOnchain    *bool
+	VerificationStatus *VerificationStatus
+}
+
+// HorizonVerifier is satisfied by *stellar.Client.
+type HorizonVerifier interface {
+	// VerifyTransaction checks that txnHash exists, was successful, and has a
+	// payment operation sent FROM expectedFrom for expectedAmount.
+	VerifyTransaction(ctx context.Context, txnHash, expectedFrom, expectedAmount string) (bool, error)
+}
+
+// Broadcaster notifies WebSocket clients when a contribution is confirmed.
 type Broadcaster interface {
 	ContributionRecorded(ctx context.Context, circleID, userID string, roundNumber int, amount float64)
-	PayoutExecuted(ctx context.Context, circleID, recipientID string, roundNumber int, amount float64)
 }
 
-type Service interface {
-	Record(ctx context.Context, input RecordInput) (*Contribution, error)
-	UpdateVerification(ctx context.Context, id string, verifiedOnchain bool, status VerificationStatus) error
-	GetUserHistory(ctx context.Context, userID string, page, limit int) ([]Contribution, int, error)
-	GetCircleHistory(ctx context.Context, circleID string, page, limit int) ([]Contribution, int, error)
-}
-
+// Transactor wraps a database transaction for atomic contribution writes.
 type Transactor interface {
 	WithTransaction(ctx context.Context, fn func(repo Repository) error) error
 }
 
-type RecordInput struct {
-	CircleID           string              `json:"circleId" validate:"required"`
-	UserID             string              `json:"userId" validate:"required"`
-	RoundNumber        int                 `json:"roundNumber" validate:"required,gte=1"`
-	Amount             float64             `json:"amount" validate:"required,gt=0"`
-	TxnHash            string              `json:"txnHash" validate:"required"`
-	VerifiedOnchain    *bool               `json:"verifiedOnchain,omitempty"`
-	VerificationStatus *VerificationStatus `json:"verificationStatus,omitempty"`
+// Service is the public API for the contribution domain.
+type Service interface {
+	// Record persists a new contribution, verifying the txnHash on-chain
+	// before saving. Returns the existing record (idempotent) when the same
+	// txnHash is submitted twice.
+	Record(ctx context.Context, input RecordInput) (*Contribution, error)
+	GetUserHistory(ctx context.Context, userID string, page, limit int) ([]Contribution, int, error)
+	GetCircleHistory(ctx context.Context, circleID string, page, limit int) ([]Contribution, int, error)
+	UpdateVerification(ctx context.Context, id string, verifiedOnchain bool, status VerificationStatus) error
 }
 
-type contributionService struct {
-	repo           Repository
-	broadcaster    Broadcaster
-	tx             Transactor
-	stellarClient  *stellar.Client
-	masterReceiver string // master public key / default recipient for contributions
+type service struct {
+	repo            Repository
+	broadcaster     Broadcaster
+	tx              Transactor
+	horizon         HorizonVerifier
+	masterPublicKey string
 }
 
-// NewService creates a contribution service. The last two parameters are optional
-// and may be nil. When a Stellar client and masterReceiver are provided, contributions
-// with a TxnHash will be verified on-chain before recording.
-func NewService(repo Repository, broadcaster Broadcaster, tx Transactor, stellarClient *stellar.Client, masterReceiver string) Service {
-	return &contributionService{repo: repo, broadcaster: broadcaster, tx: tx, stellarClient: stellarClient, masterReceiver: masterReceiver}
+// NewService constructs the contribution service.
+//
+//	broadcaster  – may be nil (no WS events)
+//	tx           – may be nil (no DB transaction wrapping)
+//	horizon      – may be nil (on-chain verification skipped; useful in tests)
+//	masterPK     – Stellar master public key; if empty the sender check is skipped
+func NewService(repo Repository, broadcaster Broadcaster, tx Transactor, horizon HorizonVerifier, masterPublicKey string) Service {
+	return &service{
+		repo:            repo,
+		broadcaster:     broadcaster,
+		tx:              tx,
+		horizon:         horizon,
+		masterPublicKey: masterPublicKey,
+	}
 }
 
-type contribTransactor struct {
-	db *sqlx.DB
-}
-
+// NewTransactor creates a DB-backed Transactor for the contribution domain.
 func NewTransactor(db *sqlx.DB) Transactor {
-	return &contribTransactor{db: db}
+	return &pgTransactor{db: db}
 }
 
-func (t *contribTransactor) WithTransaction(ctx context.Context, fn func(repo Repository) error) error {
-	tx, err := t.db.BeginTxx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+type pgTransactor struct{ db *sqlx.DB }
+
+func (t *pgTransactor) WithTransaction(ctx context.Context, fn func(repo Repository) error) error {
+	tx, err := t.db.BeginTxx(ctx, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("beginning transaction: %w", err)
 	}
 	defer func() {
 		if p := recover(); p != nil {
@@ -83,125 +103,122 @@ func (t *contribTransactor) WithTransaction(ctx context.Context, fn func(repo Re
 	return tx.Commit()
 }
 
-func parseUUID(s string) (uuid.UUID, error) {
-	id, err := uuid.Parse(s)
+// Record verifies the on-chain transaction and persists the contribution.
+// The call is idempotent: submitting the same txnHash twice returns the
+// already-recorded contribution rather than an error.
+func (s *service) Record(ctx context.Context, input RecordInput) (*Contribution, error) {
+	circleUID, err := uuid.Parse(input.CircleID)
 	if err != nil {
-		return uuid.Nil, fmt.Errorf("invalid UUID: %w", err)
+		return nil, fmt.Errorf("invalid circleID: %w", err)
 	}
-	return id, nil
-}
-
-func (s *contributionService) Record(ctx context.Context, input RecordInput) (*Contribution, error) {
-	userID, err := parseUUID(input.UserID)
+	userUID, err := uuid.Parse(input.UserID)
 	if err != nil {
-		return nil, err
-	}
-	circleID, err := parseUUID(input.CircleID)
-	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("invalid userID: %w", err)
 	}
 
-	now := time.Now().UTC()
-	txnHash := sql.NullString{String: input.TxnHash, Valid: true}
+	// Idempotency: if this txnHash was already recorded, return existing row.
+	if input.TxnHash != "" {
+		existing, err := s.repo.FindByTxnHash(ctx, input.TxnHash)
+		if err == nil && existing != nil {
+			log.Info().Str("txn_hash", input.TxnHash).Msg("contribution already recorded (idempotent replay)")
+			return existing, nil
+		}
+	}
 
+	// Determine verification state — caller may override (e.g. indexer).
 	verifiedOnchain := false
+	verificationStatus := VerificationStatusUnverified
+
 	if input.VerifiedOnchain != nil {
 		verifiedOnchain = *input.VerifiedOnchain
 	}
-	verificationStatus := VerificationStatusUnverified
 	if input.VerificationStatus != nil {
 		verificationStatus = *input.VerificationStatus
-	} else if verifiedOnchain {
-		verificationStatus = VerificationStatusVerified
+	}
+
+	// On-chain verification: only run when horizon client is available and
+	// the caller has NOT already supplied an explicit verification state.
+	if s.horizon != nil && input.TxnHash != "" &&
+		input.VerifiedOnchain == nil && input.VerificationStatus == nil {
+
+		amountStr := fmt.Sprintf("%.7f", input.Amount)
+		ok, verErr := s.horizon.VerifyTransaction(ctx, input.TxnHash, s.masterPublicKey, amountStr)
+		if verErr != nil {
+			// Horizon is unavailable — record as pending for async retry.
+			log.Warn().Err(verErr).Str("txn_hash", input.TxnHash).
+				Msg("horizon verification failed; recording contribution as pending")
+			verificationStatus = VerificationStatusPending
+		} else if !ok {
+			// Transaction does not match — reject immediately.
+			metrics.ContributionsTotal.WithLabelValues("rejected", "", "").Inc()
+			return nil, fmt.Errorf("on-chain verification failed: txnHash %s does not match expected sender/amount", input.TxnHash)
+		} else {
+			verifiedOnchain = true
+			verificationStatus = VerificationStatusVerified
+		}
 	}
 
 	c := &Contribution{
 		ID:                 uuid.New(),
-		CircleID:           circleID,
-		UserID:             userID,
+		CircleID:           circleUID,
+		UserID:             userUID,
 		RoundNumber:        input.RoundNumber,
 		Amount:             input.Amount,
-		TxnHash:            txnHash,
+		TxnHash:            sql.NullString{String: input.TxnHash, Valid: input.TxnHash != ""},
 		Status:             StatusPending,
 		OnTime:             true,
 		VerifiedOnchain:    verifiedOnchain,
 		VerificationStatus: verificationStatus,
-		CreatedAt:          now,
-		UpdatedAt:          now,
+		CreatedAt:          time.Now().UTC(),
+		UpdatedAt:          time.Now().UTC(),
 	}
 
-	// If a Stellar client is configured, verify the transaction on-chain.
-	if s.stellarClient != nil && input.TxnHash != "" {
-		// Format amount to match Horizon string representation (7 decimal places)
-		amtStr := strconv.FormatFloat(input.Amount, 'f', 7, 64)
-		ok, err := s.stellarClient.VerifyTransaction(ctx, input.TxnHash, s.masterReceiver, amtStr)
-		if err != nil {
-			return nil, fmt.Errorf("failed to verify transaction: %w", err)
-		}
-		if !ok {
-			return nil, fmt.Errorf("on-chain verification failed")
-		}
-		// mark verified
-		c.VerifiedOnchain = true
-		c.VerificationStatus = VerificationStatusVerified
-	}
-
-	if s.tx != nil {
-		err := s.tx.WithTransaction(ctx, func(repo Repository) error {
-			if err := repo.Create(ctx, c); err != nil {
-				if err == apperrors.ErrConflict {
-					return fmt.Errorf("duplicate contribution: %w", err)
-				}
-				return fmt.Errorf("recording contribution: %w", err)
-			}
-			return nil
-		})
-		if err == nil && s.broadcaster != nil {
-			s.broadcaster.ContributionRecorded(ctx, input.CircleID, input.UserID, input.RoundNumber, input.Amount)
-		}
-		return c, err
+	if verifiedOnchain {
+		c.Status = StatusConfirmed
 	}
 
 	if err := s.repo.Create(ctx, c); err != nil {
 		if err == apperrors.ErrConflict {
-			return nil, fmt.Errorf("duplicate contribution: %w", err)
+			// Race: another request created the same row first — return existing.
+			existing, fErr := s.repo.FindByTxnHash(ctx, input.TxnHash)
+			if fErr == nil && existing != nil {
+				return existing, nil
+			}
 		}
-		return nil, fmt.Errorf("recording contribution: %w", err)
+		metrics.ContributionsTotal.WithLabelValues("failure", "", "").Inc()
+		return nil, fmt.Errorf("saving contribution: %w", err)
 	}
+
+	metrics.ContributionsTotal.WithLabelValues("success", "", "").Inc()
+	metrics.ContributionVolumeTotal.WithLabelValues("").Add(input.Amount)
+
 	if s.broadcaster != nil {
 		s.broadcaster.ContributionRecorded(ctx, input.CircleID, input.UserID, input.RoundNumber, input.Amount)
 	}
+
 	return c, nil
 }
 
-func (s *contributionService) UpdateVerification(ctx context.Context, id string, verifiedOnchain bool, status VerificationStatus) error {
-	uid, err := parseUUID(id)
+func (s *service) GetUserHistory(ctx context.Context, userID string, page, limit int) ([]Contribution, int, error) {
+	uid, err := uuid.Parse(userID)
 	if err != nil {
-		return err
+		return nil, 0, fmt.Errorf("invalid userID: %w", err)
+	}
+	return s.repo.ListByUser(ctx, uid, page, limit)
+}
+
+func (s *service) GetCircleHistory(ctx context.Context, circleID string, page, limit int) ([]Contribution, int, error) {
+	cid, err := uuid.Parse(circleID)
+	if err != nil {
+		return nil, 0, fmt.Errorf("invalid circleID: %w", err)
+	}
+	return s.repo.ListByCircle(ctx, cid, page, limit)
+}
+
+func (s *service) UpdateVerification(ctx context.Context, id string, verifiedOnchain bool, status VerificationStatus) error {
+	uid, err := uuid.Parse(id)
+	if err != nil {
+		return fmt.Errorf("invalid contribution ID: %w", err)
 	}
 	return s.repo.UpdateVerificationStatus(ctx, uid, verifiedOnchain, status)
-}
-
-func (s *contributionService) GetUserHistory(ctx context.Context, userID string, page, limit int) ([]Contribution, int, error) {
-	uid, err := parseUUID(userID)
-	if err != nil {
-		return nil, 0, err
-	}
-	contribs, total, err := s.repo.ListByUser(ctx, uid, page, limit)
-	if err != nil {
-		return nil, 0, fmt.Errorf("getting user contribution history: %w", err)
-	}
-	return contribs, total, nil
-}
-
-func (s *contributionService) GetCircleHistory(ctx context.Context, circleID string, page, limit int) ([]Contribution, int, error) {
-	cid, err := parseUUID(circleID)
-	if err != nil {
-		return nil, 0, err
-	}
-	contribs, total, err := s.repo.ListByCircle(ctx, cid, page, limit)
-	if err != nil {
-		return nil, 0, fmt.Errorf("getting circle contribution history: %w", err)
-	}
-	return contribs, total, nil
 }

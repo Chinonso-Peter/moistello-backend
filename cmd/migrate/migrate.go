@@ -38,7 +38,7 @@ type Options struct {
 
 	// Count limits how many migrations are applied ("up") or reverted
 	// ("down"). When zero: "up" applies every pending migration and "down"
-	// reverts exactly one step. Mutually exclusive with To.
+	// reverts every applied migration. Mutually exclusive with To.
 	Count int
 }
 
@@ -66,7 +66,7 @@ var barePrefixRe = regexp.MustCompile(`^\d+$`)
 //
 // The full filename stem is used as the identity of a migration so that
 // migrations sharing a numeric prefix (016_email_verifications vs
-// 016_widen_wallet_address, 035_create_governance vs 035_create_swap_offers)
+// 016_widen_wallet_address, 035_create_governance vs 042_create_swap_offers)
 // remain distinct, trackable versions instead of colliding inside
 // schema_migrations.
 func versionFromPath(path string) string {
@@ -235,9 +235,6 @@ func selectDownFiles(downFiles, orderedFiles []string, applied map[string]bool, 
 	}
 
 	limit := opts.Count
-	if targetIdx < 0 && limit == 0 {
-		limit = 1 // safe default: revert a single step
-	}
 
 	order := make(map[string]int, len(orderedFiles))
 	for i, f := range orderedFiles {

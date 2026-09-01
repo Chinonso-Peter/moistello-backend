@@ -93,6 +93,22 @@ func TestHealthHandler_Readiness_Unhealthy(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "not ready")
 }
 
+func TestHealthHandler_Readiness_Healthy(t *testing.T) {
+	h, mock, cleanup := setupTestHealthHandler(t)
+	defer cleanup()
+
+	mock.ExpectPing()
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/health/ready", nil)
+
+	h.Readiness(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), "ready")
+}
+
 func TestHealthHandler_Liveness(t *testing.T) {
 	h, _, cleanup := setupTestHealthHandler(t)
 	defer cleanup()
