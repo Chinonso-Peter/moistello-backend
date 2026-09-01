@@ -226,4 +226,3 @@ func TestWebhookIncoming_WrongSignatureRejected(t *testing.T) {
 
 	assert.Equal(t, http.StatusUnauthorized, w2.Code, "wrong signature must be rejected")
 }
-
