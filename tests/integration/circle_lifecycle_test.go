@@ -89,6 +89,7 @@ func TestCircleLifecycle(t *testing.T) {
 	})
 
 	t.Run("Step4_RecordContribution", func(t *testing.T) {
+		contribRepo.On("FindByTxnHash", mock.Anything, "txn-lc-001").Return(nil, nil).Once()
 		contribRepo.On("Create", mock.Anything, mock.AnythingOfType("*contribution.Contribution")).Return(nil).Once()
 
 		c, err := contribSvc.Record(nil, contribution.RecordInput{
@@ -107,6 +108,7 @@ func TestCircleLifecycle(t *testing.T) {
 
 	t.Run("Step5_RecordPayout", func(t *testing.T) {
 		circleID := uuid.New()
+		payoutRepo.On("FindByTxnHash", mock.Anything, "txn-payout-001").Return(nil, nil).Once()
 		payoutRepo.On("ListByCircle", mock.Anything, circleID, 1, 100).Return([]payout.Payout{}, 0, nil).Once()
 		payoutRepo.On("Create", mock.Anything, mock.AnythingOfType("*payout.Payout")).Return(nil).Once()
 

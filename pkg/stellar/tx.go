@@ -37,11 +37,11 @@ func SignXDR(xdr string, networkPassphrase string, kp *keypair.Full) (string, er
 
 // PaymentParams holds the parameters for building a Stellar payment transaction.
 type PaymentParams struct {
-	Destination    string
-	AssetCode      string  // "XLM" for native asset, otherwise the asset code (e.g. "USDC")
-	AssetIssuer    string  // issuer for non-native assets
-	Amount         float64
-	Memo           string
+	Destination       string
+	AssetCode         string // "XLM" for native asset, otherwise the asset code (e.g. "USDC")
+	AssetIssuer       string // issuer for non-native assets
+	Amount            float64
+	Memo              string
 	NetworkPassphrase string
 }
 

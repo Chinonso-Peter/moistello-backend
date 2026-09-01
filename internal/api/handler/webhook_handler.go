@@ -65,6 +65,9 @@ func (h *WebhookHandler) RegisterWebhook(c *gin.Context) {
 		Events:     req.Events,
 		IsActive:   true,
 	}
+	// The secret must never be persisted — clear it before handing the record
+	// to the repository so only secret_hash is stored.
+	record.Secret = ""
 	if err := h.repo.Register(c.Request.Context(), record); err != nil {
 		response.InternalError(c, "failed to register webhook")
 		return
