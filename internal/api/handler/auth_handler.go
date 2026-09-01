@@ -3,7 +3,6 @@ package handler
 import (
 	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"fmt"
 	"strings"
 	"time"
@@ -19,7 +18,6 @@ import (
 	"github.com/moistello/backend/internal/domain/user"
 	"github.com/moistello/backend/internal/domain/verification"
 	"github.com/moistello/backend/internal/domain/wallet"
-	"github.com/moistello/backend/pkg/apperrors"
 	"github.com/moistello/backend/pkg/response"
 	"github.com/moistello/backend/pkg/stellar"
 )
@@ -113,7 +111,7 @@ func (h *AuthHandler) Verify(c *gin.Context) {
 		return
 	}
 
-	pair, err := h.authService.CreateSession(c.Request.Context(), u.ID, string(u.Role), sessionTTLFromUser(u), deviceInfoFromContext(c))
+	pair, err := h.authService.CreateSession(c.Request.Context(), u.ID, string(u.Role), time.Duration(sessionTTLFromUser(u))*time.Minute, deviceInfoFromContext(c))
 	if err != nil {
 		response.InternalError(c, "failed to create session")
 		return
@@ -168,13 +166,13 @@ func (h *AuthHandler) Me(c *gin.Context) {
 	response.OK(c, gin.H{"user": u})
 }
 
-// @Summary Logout / Terminate Session
-// @Description Invalidates the current session and all refresh tokens. REST standard: DELETE /v1/auth/sessions
+// @Summary Logout
+// @Description Invalidates the current session and all refresh tokens.
 // @Tags Authentication
 // @Produce json
 // @Security BearerAuth
 // @Success 200 {object} response.Envelope{data=object{success=bool}}
-// @Router /auth/sessions [delete]
+// @Router /auth/logout [post]
 func (h *AuthHandler) Logout(c *gin.Context) {
 	authHeader := c.GetHeader("Authorization")
 	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
@@ -223,229 +221,560 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 	response.OK(c, gin.H{"success": true})
 }
 
-// @Summary Revoke specific session by ID/hash
-// @Description Revokes a specific session.
-// @Tags Authentication
-// @Produce json
-// @Security BearerAuth
-// @Param id path string true "Session Hash / ID"
-// @Success 200 {object} response.Envelope{data=object{success=bool}}
-// @Router /auth/sessions/{id} [delete]
-func (h *AuthHandler) RevokeSessionByID(c *gin.Context) {
-	sessionID := c.Param("id")
-	userID := middleware.GetUserID(c)
-	ctx := c.Request.Context()
+// ──────────────────────────────────────────────
+// Email OTP Registration & Login
+// ──────────────────────────────────────────────
 
-	if h.redisClient != nil && sessionID != "" {
-		// If the id is a session hash, delete it directly, or remove from user sessions
-		sessionKey := fmt.Sprintf("session:%s", sessionID)
-		h.redisClient.Del(ctx, sessionKey)
-		if userID != "" {
-			userSessionsKey := fmt.Sprintf("user:sessions:%s", userID)
-			h.redisClient.SRem(ctx, userSessionsKey, sessionID)
-		}
-	}
+// Register sends an email OTP to begin registration.
+// POST /auth/register { email }
+// ── Registration: Email + Password ──
 
-	response.OK(c, gin.H{"success": true})
-}
-
-// Register starts the email-based registration flow.  It accepts an email +
-// password, checks for existing accounts, and dispatches a 6-digit OTP to the
-// provided email address.  The pending registration is stored in Redis until
-// RegisterVerify confirms the OTP.
-//
-// Email is stored using user.HashEmail (full SHA-256 hex) — the single
-// canonical representation used by FindByEmail and UpdateProfile.
-//
-// @Summary Start email registration
-// @Tags Authentication
-// @Accept json
-// @Produce json
-// @Param body body object true "Registration payload" {"email":"string","password":"string"}
-// @Success 201 {object} response.Envelope
-// @Failure 400 {object} response.Envelope
-// @Failure 409 {object} response.Envelope
-// @Router /auth/register [post]
+// Register creates a user with email+password and sends email OTP.
+// POST /auth/register { email, password }
 func (h *AuthHandler) Register(c *gin.Context) {
 	var req struct {
 		Email    string `json:"email" binding:"required,email"`
 		Password string `json:"password" binding:"required,min=8"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		response.BadRequest(c, "valid email and password (min 8 chars) are required")
 		return
 	}
 
-	// Derive a deterministic wallet address for email-based accounts.
-	// Using the first 16 bytes of the SHA-256 digest gives a compact,
-	// unique, non-reversible identifier.
-	emailHash := sha256.Sum256([]byte(req.Email))
-	walletAddr := "EMAIL:" + hex.EncodeToString(emailHash[:16])
-
-	// Check for existing account using the wallet address key.
-	existing, err := h.userRepo.FindByWalletAddress(c.Request.Context(), walletAddr)
-	if err != nil && err != apperrors.ErrNotFound {
-		response.InternalError(c, "failed to check existing account")
-		return
-	}
-	if existing != nil {
-		response.Conflict(c, "account already exists")
+	// Check if email already exists (by wallet address lookup)
+	walletAddr := emailToWalletAddr(req.Email)
+	existing, err := h.userService.GetByWallet(c.Request.Context(), walletAddr)
+	if err == nil && existing != nil {
+		response.Conflict(c, "email already registered. please log in.")
 		return
 	}
 
-	// Hash the password before storing in pending registration.
-	passwordHash, err := h.authService.HashPassword(req.Password)
+	// Check if there's already a pending registration for this email
+	pending, err := h.verificationSvc.GetPendingRegistration(c.Request.Context(), req.Email)
+	if err != nil {
+		response.InternalError(c, "failed to check pending registration")
+		return
+	}
+	if pending != nil {
+		response.Conflict(c, "a verification code was already sent. check your email.")
+		return
+	}
+
+	// Hash password
+	passwordHash, err := auth.HashPassword(req.Password)
 	if err != nil {
 		response.InternalError(c, "failed to process password")
 		return
 	}
 
-	// Store the pending registration and send the OTP.
-	pending := verification.PendingRegistration{
-		Email:        req.Email,
+	// Store in Redis — NOT in PostgreSQL. User is only created after email verification.
+	pendingData := &verification.PendingRegistration{
 		PasswordHash: passwordHash,
 		WalletAddr:   walletAddr,
+		Email:        req.Email,
 	}
-	if err := h.verificationSvc.StorePendingRegistration(c.Request.Context(), req.Email, pending); err != nil {
-		response.InternalError(c, "failed to store pending registration")
+	if err := h.verificationSvc.StorePendingRegistration(c.Request.Context(), req.Email, pendingData); err != nil {
+		response.InternalError(c, "failed to save registration data")
 		return
 	}
 
+	// Send OTP
 	if err := h.verificationSvc.SendOTP(c.Request.Context(), req.Email); err != nil {
 		response.InternalError(c, "failed to send verification code")
 		return
 	}
 
-	response.Created(c, gin.H{"message": "verification code sent to your email"})
+	response.Created(c, gin.H{
+		"message":   "verification code sent",
+		"expiresIn": 300,
+	})
 }
 
-// RegisterVerify completes the email registration flow by confirming the OTP.
-// On success it creates the user record (with hashed email), creates the
-// on-chain wallet, and issues a session.
-//
-// @Summary Complete email registration
-// @Tags Authentication
-// @Accept json
-// @Produce json
-// @Param body body object true "Verification payload" {"email":"string","code":"string"}
-// @Success 201 {object} response.Envelope
-// @Failure 400 {object} response.Envelope
-// @Router /auth/register/verify [post]
+// RegisterVerify verifies the email OTP, creates the user, and returns a session.
+// POST /auth/register/verify { email, code }
 func (h *AuthHandler) RegisterVerify(c *gin.Context) {
 	var req struct {
 		Email string `json:"email" binding:"required,email"`
-		Code  string `json:"code" binding:"required"`
+		Code  string `json:"code" binding:"required,len=6"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		response.BadRequest(c, "email and 6-digit code are required")
 		return
 	}
 
-	// Verify the OTP.
-	if err := h.verificationSvc.VerifyOTP(c.Request.Context(), req.Email, req.Code); err != nil {
+	valid, err := h.verificationSvc.VerifyOTP(c.Request.Context(), req.Email, req.Code)
+	if err != nil || !valid {
 		response.BadRequest(c, "invalid or expired verification code")
 		return
 	}
 
-	// Retrieve the pending registration payload.
+	// Read pending registration from Redis — user hasn't been created yet
 	pending, err := h.verificationSvc.GetPendingRegistration(c.Request.Context(), req.Email)
 	if err != nil {
-		response.BadRequest(c, "registration session expired; please register again")
+		response.InternalError(c, "failed to read registration data")
+		return
+	}
+	if pending == nil {
+		response.BadRequest(c, "registration session expired. please start over.")
 		return
 	}
 
-	ctx := c.Request.Context()
+	// Double-check the user doesn't already exist (prevent race condition)
+	existing, err := h.userService.GetByWallet(c.Request.Context(), pending.WalletAddr)
+	if err == nil && existing != nil {
+		response.Conflict(c, "account already exists.")
+		return
+	}
 
-	// Hash the email using the single canonical transform: full SHA-256 hex.
-	// This matches FindByEmail and UpdateProfile so all paths are consistent.
-	hashedEmail := user.HashEmail(req.Email)
-
-	now := time.Now().UTC()
+	// Create the user NOW — only after email is verified
+	hashedEmail := user.HashEmail(pending.Email)
 	u := &user.User{
 		ID:                uuid.New(),
 		WalletAddress:     pending.WalletAddr,
-		PreferredLanguage: "en",
-		Role:              user.RoleUser,
+		PasswordHash:      passwordHashStruct(pending.PasswordHash),
 		Email:             &hashedEmail,
 		EmailVerified:     true,
-		MoiScore:          0,
-		CreatedAt:         now,
-		UpdatedAt:         now,
+		PreferredLanguage: "en",
+		Role:              user.RoleUser,
+		CreatedAt:         time.Now().UTC(),
+		UpdatedAt:         time.Now().UTC(),
 	}
-	// Store the password hash if provided.
-	if pending.PasswordHash != "" {
-		u.PasswordHash = sql.NullString{String: pending.PasswordHash, Valid: true}
-	}
-
-	if err := h.userRepo.Create(ctx, u); err != nil {
-		if err == apperrors.ErrConflict {
-			response.Conflict(c, "account already exists")
-			return
-		}
+	if err := h.userRepo.Create(c.Request.Context(), u); err != nil {
 		response.InternalError(c, "failed to create account")
 		return
 	}
 
-	// Derive wallet seed and create the on-chain wallet.
-	if h.walletSvc != nil {
-		seed, seedErr := h.walletSvc.DeriveWalletSeed(ctx, req.Email)
-		if seedErr == nil {
-			seedBytes := []byte(seed)
-			// Ignore wallet creation errors — user is already persisted.
-			_, _ = h.walletSvc.CreateWallet(ctx, u.ID.String(), seedBytes)
+	// Auto-create Stellar wallet on registration (closes #115):
+	// Generate keypair, fund from master XLM pool, set USDC trustline,
+	// and store AES-256-GCM-encrypted secret key in the wallets table.
+	// Wallet creation is non-blocking — a failure is logged but does NOT
+	// abort registration. The user can retry via POST /auth/wallet/init.
+	walletSeed, seedErr := h.walletSvc.DeriveWalletSeed(c.Request.Context(), req.Email)
+	if seedErr == nil {
+		if _, wErr := h.walletSvc.CreateWallet(c.Request.Context(), u.ID.String(), []byte(walletSeed)); wErr != nil {
+			// Log but don't fail registration
+			_ = wErr // already logged inside CreateWallet
 		}
 	}
 
-	// Clean up the pending registration.
-	_ = h.verificationSvc.DeletePendingRegistration(ctx, req.Email)
+	h.verificationSvc.DeletePendingRegistration(c.Request.Context(), req.Email)
 
-	// Issue a session.
-	pair, err := h.authService.CreateSession(ctx, u.ID, string(u.Role), sessionTTLFromUser(u), deviceInfoFromContext(c))
+	pair, err := h.authService.CreateSession(c.Request.Context(), u.ID, string(u.Role), time.Duration(sessionTTLFromUser(u))*time.Minute, deviceInfoFromContext(c))
 	if err != nil {
 		response.InternalError(c, "failed to create session")
 		return
 	}
 
 	response.Created(c, gin.H{
-		"token":        pair.AccessToken,
-		"refreshToken": pair.RefreshToken,
-		"csrfToken":    pair.CSRFToken,
+		"token": pair.AccessToken, "refreshToken": pair.RefreshToken, "csrfToken": pair.CSRFToken, "user": u,
 	})
 }
 
-// ─── helpers ──────────────────────────────────────────────────────────────────
-
-// emailWalletAddress returns the deterministic pseudo-wallet address used for
-// email-based accounts.  It is a stable, non-reversible identifier derived
-// from the first 16 bytes of the email's SHA-256 digest.
-func emailWalletAddress(email string) string {
-	h := sha256.Sum256([]byte(email))
-	return "EMAIL:" + hex.EncodeToString(h[:16])
-}
-
-// sha256HashForLogout returns a hex-encoded SHA-256 digest of s; used to
-// derive the Redis session key when revoking refresh tokens on logout.
-func sha256HashForLogout(s string) string {
-	h := sha256.Sum256([]byte(s))
-	return hex.EncodeToString(h[:])
-}
-
-// sessionTTLFromUser returns the per-user access-token TTL in minutes,
-// falling back to 15 minutes when the user has not configured a custom TTL.
-func sessionTTLFromUser(u *user.User) int {
-	if u != nil && u.SessionTTLMinutes > 0 {
-		return u.SessionTTLMinutes
+// ── Login: Email + Password ──
+// POST /auth/login { email, password }
+func (h *AuthHandler) Login(c *gin.Context) {
+	var req struct {
+		Email    string `json:"email" binding:"required,email"`
+		Password string `json:"password" binding:"required"`
 	}
-	return 15
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "email and password are required")
+		return
+	}
+
+	walletAddr := emailToWalletAddr(req.Email)
+	u, err := h.userService.GetByWallet(c.Request.Context(), walletAddr)
+	if err != nil {
+		response.NotFound(c, "account not found")
+		return
+	}
+
+	if !u.PasswordHash.Valid {
+		response.BadRequest(c, "account has no password set. use passkey.")
+		return
+	}
+
+	if !auth.VerifyPassword(req.Password, u.PasswordHash.String) {
+		response.Unauthorized(c, "incorrect password")
+		return
+	}
+
+	if !u.EmailVerified {
+		if err := h.verificationSvc.SendOTP(c.Request.Context(), req.Email); err != nil {
+			response.InternalError(c, "failed to send verification code")
+			return
+		}
+		response.OK(c, gin.H{"needsVerification": true, "message": "email not verified. code sent."})
+		return
+	}
+
+	pair, err := h.authService.CreateSession(c.Request.Context(), u.ID, string(u.Role), time.Duration(sessionTTLFromUser(u))*time.Minute, deviceInfoFromContext(c))
+	if err != nil {
+		response.InternalError(c, "failed to create session")
+		return
+	}
+
+	response.OK(c, gin.H{
+		"token": pair.AccessToken, "refreshToken": pair.RefreshToken, "csrfToken": pair.CSRFToken, "user": u,
+	})
 }
 
-// deviceInfoFromContext extracts a best-effort device/browser label from the
-// User-Agent header for session tracking.
+// ── Passkey Authentication ──
+
+// PasskeyNonce generates a nonce for passkey-based wallet authentication.
+// POST /auth/passkey/nonce { credentialId }
+func (h *AuthHandler) PasskeyNonce(c *gin.Context) {
+	var req struct {
+		CredentialID string `json:"credentialId" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "credentialId is required")
+		return
+	}
+
+	// Look up user by passkey credential
+	u, err := h.userRepo.FindByPasskeyCredentialID(c.Request.Context(), req.CredentialID)
+	if err != nil {
+		response.NotFound(c, "passkey not linked to any account")
+		return
+	}
+
+	// Generate nonce for the user's wallet address
+	nonce, err := h.authService.GenerateNonce(c.Request.Context(), u.WalletAddress)
+	if err != nil {
+		response.InternalError(c, "failed to generate nonce")
+		return
+	}
+
+	response.OK(c, gin.H{"nonce": nonce, "walletAddress": u.WalletAddress})
+}
+
+// PasskeyVerify verifies a passkey-signed nonce and creates a session.
+// POST /auth/passkey/verify { credentialId, signature }
+func (h *AuthHandler) PasskeyVerify(c *gin.Context) {
+	var req struct {
+		CredentialID string `json:"credentialId" binding:"required"`
+		Signature    string `json:"signature" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "credentialId and signature are required")
+		return
+	}
+
+	u, err := h.userRepo.FindByPasskeyCredentialID(c.Request.Context(), req.CredentialID)
+	if err != nil {
+		response.NotFound(c, "passkey not linked to any account")
+		return
+	}
+
+	valid, err := h.authService.VerifySignature(c.Request.Context(), u.WalletAddress, req.Signature)
+	if err != nil || !valid {
+		response.Unauthorized(c, "signature verification failed")
+		return
+	}
+
+	pair, err := h.authService.CreateSession(c.Request.Context(), u.ID, string(u.Role), time.Duration(sessionTTLFromUser(u))*time.Minute, deviceInfoFromContext(c))
+	if err != nil {
+		response.InternalError(c, "failed to create session")
+		return
+	}
+
+	response.OK(c, gin.H{
+		"token": pair.AccessToken, "refreshToken": pair.RefreshToken, "csrfToken": pair.CSRFToken, "user": u,
+	})
+}
+
+// ── Optional TOTP 2FA (Settings only) ──
+
+// SetupTOTP generates a new TOTP secret for an authenticated user.
+// POST /auth/totp/setup [AUTH]
+func (h *AuthHandler) SetupTOTP(c *gin.Context) {
+	userID := middleware.GetUserID(c)
+	u, err := h.userService.GetByID(c.Request.Context(), userID)
+	if err != nil {
+		response.NotFound(c, "user not found")
+		return
+	}
+
+	email := ""
+	if u.Email != nil {
+		email = *u.Email
+	}
+
+	totpSecret, totpURI, err := h.totpService.GenerateSecret(email)
+	if err != nil {
+		response.InternalError(c, "failed to generate TOTP secret")
+		return
+	}
+
+	u.TOTPSecret = totpSecretString(totpSecret)
+	u.TOTPEnabled = false
+	h.userRepo.Update(c.Request.Context(), u)
+
+	response.OK(c, gin.H{"totpSecret": totpSecret, "totpUri": totpURI})
+}
+
+// VerifyTOTPSetup confirms TOTP setup and generates backup codes.
+// POST /auth/totp/verify [AUTH] { totpCode }
+func (h *AuthHandler) VerifyTOTPSetup(c *gin.Context) {
+	userID := middleware.GetUserID(c)
+	var req struct {
+		TOTPCode string `json:"totpCode" binding:"required,len=6"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "6-digit TOTP code is required")
+		return
+	}
+
+	u, err := h.userService.GetByID(c.Request.Context(), userID)
+	if err != nil {
+		response.NotFound(c, "user not found")
+		return
+	}
+	if !u.TOTPSecret.Valid {
+		response.BadRequest(c, "TOTP not set up. use /auth/totp/setup first.")
+		return
+	}
+	if !h.totpService.ValidateCode(u.TOTPSecret.String, req.TOTPCode) {
+		response.BadRequest(c, "invalid TOTP code")
+		return
+	}
+
+	backupCodes, err := h.totpService.GenerateBackupCodes()
+	if err != nil {
+		response.InternalError(c, "failed to generate backup codes")
+		return
+	}
+
+	u.TOTPEnabled = true
+	u.BackupCodes = h.totpService.HashBackupCodes(backupCodes)
+	h.userRepo.Update(c.Request.Context(), u)
+
+	plainCodes := make([]string, len(backupCodes))
+	for i, bc := range backupCodes {
+		plainCodes[i] = bc.Plain
+	}
+	response.OK(c, gin.H{"backupCodes": plainCodes})
+}
+
+// Recovery uses a backup code to log in (bypasses TOTP).
+// POST /auth/recovery { email, backupCode }
+func (h *AuthHandler) Recovery(c *gin.Context) {
+	var req struct {
+		Email      string `json:"email" binding:"required,email"`
+		BackupCode string `json:"backupCode" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "email and backup code are required")
+		return
+	}
+
+	walletAddr := emailToWalletAddr(req.Email)
+	u, err := h.userService.GetByWallet(c.Request.Context(), walletAddr)
+	if err != nil {
+		response.NotFound(c, "account not found")
+		return
+	}
+	if len(u.BackupCodes) == 0 {
+		response.BadRequest(c, "no backup codes remaining")
+		return
+	}
+
+	remaining, valid := h.totpService.ValidateBackupCode(req.BackupCode, u.BackupCodes)
+	if !valid {
+		response.BadRequest(c, "invalid backup code")
+		return
+	}
+
+	u.BackupCodes = remaining
+	h.userRepo.Update(c.Request.Context(), u)
+
+	pair, err := h.authService.CreateSession(c.Request.Context(), u.ID, string(u.Role), time.Duration(sessionTTLFromUser(u))*time.Minute, deviceInfoFromContext(c))
+	if err != nil {
+		response.InternalError(c, "failed to create session")
+		return
+	}
+
+	response.OK(c, gin.H{
+		"token": pair.AccessToken, "refreshToken": pair.RefreshToken, "csrfToken": pair.CSRFToken, "user": u,
+	})
+}
+
+// ── Wallet Initialization ──
+
+// InitWallet creates the user's Stellar wallet from their email-derived seed.
+// POST /auth/wallet/init [AUTH]
+func (h *AuthHandler) InitWallet(c *gin.Context) {
+	userID := middleware.GetUserID(c)
+	if userID == "" {
+		response.Unauthorized(c, "not authenticated")
+		return
+	}
+
+	u, err := h.userService.GetByID(c.Request.Context(), userID)
+	if err != nil {
+		response.NotFound(c, "user not found")
+		return
+	}
+
+	email := ""
+	if u.Email != nil {
+		email = *u.Email
+	}
+	if email == "" {
+		response.BadRequest(c, "no email on account")
+		return
+	}
+
+	walletSeed, err := h.walletSvc.DeriveWalletSeed(c.Request.Context(), email)
+	if err != nil {
+		response.InternalError(c, "wallet seed generation failed: "+err.Error())
+		return
+	}
+	w, err := h.walletSvc.CreateWallet(c.Request.Context(), userID, []byte(walletSeed))
+	if err != nil {
+		response.InternalError(c, "wallet creation failed: "+err.Error())
+		return
+	}
+
+	response.Created(c, gin.H{"wallet": w})
+}
+
+// PasskeyLink links a passkey credential to the authenticated user's account.
+// POST /auth/passkey/link [AUTH] { credentialId }
+func (h *AuthHandler) PasskeyLink(c *gin.Context) {
+	userID := middleware.GetUserID(c)
+	var req struct {
+		CredentialID string `json:"credentialId" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "credentialId is required")
+		return
+	}
+
+	u, err := h.userService.GetByID(c.Request.Context(), userID)
+	if err != nil {
+		response.NotFound(c, "user not found")
+		return
+	}
+
+	u.PasskeyCredentialID = &req.CredentialID
+	if err := h.userRepo.Update(c.Request.Context(), u); err != nil {
+		response.InternalError(c, "failed to link passkey")
+		return
+	}
+
+	response.OK(c, gin.H{"success": true})
+}
+
+// ── Session Management ──
+
+// ListSessions returns all active sessions for the authenticated user.
+// GET /sessions [AUTH]
+func (h *AuthHandler) ListSessions(c *gin.Context) {
+	userID := middleware.GetUserID(c)
+	if userID == "" {
+		response.Unauthorized(c, "not authenticated")
+		return
+	}
+
+	authHeader := c.GetHeader("Authorization")
+	currentHash := ""
+	if authHeader != "" {
+		parts := strings.SplitN(authHeader, " ", 2)
+		if len(parts) == 2 {
+			sha := sha256.Sum256([]byte(parts[1]))
+			currentHash = fmt.Sprintf("%x", sha)
+		}
+	}
+
+	sessions, err := h.authService.ListSessions(c.Request.Context(), userID, currentHash)
+	if err != nil {
+		response.InternalError(c, "failed to list sessions")
+		return
+	}
+
+	response.OK(c, gin.H{"sessions": sessions})
+}
+
+// RevokeSession revokes a specific session by its hash.
+// DELETE /sessions/:id [AUTH]
+func (h *AuthHandler) RevokeSession(c *gin.Context) {
+	userID := middleware.GetUserID(c)
+	sessionHash := c.Param("id")
+	if sessionHash == "" {
+		response.BadRequest(c, "session ID is required")
+		return
+	}
+
+	if err := h.authService.RevokeSession(c.Request.Context(), userID, sessionHash); err != nil {
+		response.InternalError(c, "failed to revoke session")
+		return
+	}
+
+	response.OK(c, gin.H{"success": true})
+}
+
+// RevokeAllSessions revokes all sessions except the current one.
+// DELETE /sessions [AUTH]
+func (h *AuthHandler) RevokeAllSessions(c *gin.Context) {
+	userID := middleware.GetUserID(c)
+
+	authHeader := c.GetHeader("Authorization")
+	currentHash := ""
+	if authHeader != "" {
+		parts := strings.SplitN(authHeader, " ", 2)
+		if len(parts) == 2 {
+			sha := sha256.Sum256([]byte(parts[1]))
+			currentHash = fmt.Sprintf("%x", sha)
+		}
+	}
+
+	if err := h.authService.RevokeAllSessions(c.Request.Context(), userID, currentHash); err != nil {
+		response.InternalError(c, "failed to revoke sessions")
+		return
+	}
+
+	response.OK(c, gin.H{"success": true})
+}
+
+// totpSecretString wraps a TOTP secret as sql.NullString.
+func totpSecretString(s string) sql.NullString {
+	return sql.NullString{String: s, Valid: true}
+}
+
+// emailToWalletAddr converts an email to the wallet address format used in the users table.
+// Must match the format in the Register handler.
+func emailToWalletAddr(email string) string {
+	emailHash := sha256.Sum256([]byte(email))
+	return fmt.Sprintf("EMAIL:%x", emailHash[:16])
+}
+
+func sessionTTLFromUser(u *user.User) time.Duration {
+	ttl := u.SessionTTLMinutes
+	if ttl < 60 {
+		ttl = 240
+	}
+	return time.Duration(ttl) * time.Minute
+}
+
 func deviceInfoFromContext(c *gin.Context) string {
 	ua := c.GetHeader("User-Agent")
-	if len(ua) > 200 {
-		return ua[:200]
+	if ua == "" {
+		ua = "unknown"
 	}
-	return ua
+	ip := c.ClientIP()
+	if ip == "" {
+		ip = "unknown"
+	}
+	return fmt.Sprintf("%s|%s", ua, ip)
 }
 
+func passwordHashStruct(s string) sql.NullString {
+	return sql.NullString{String: s, Valid: true}
+}
+
+func sha256HashForLogout(s string) string {
+	hash := sha256.Sum256([]byte(s))
+	return fmt.Sprintf("%x", hash)
+}

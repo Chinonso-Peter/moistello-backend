@@ -131,6 +131,7 @@ func newRegisterEnv(t *testing.T) *registerTestEnv {
 	// returns a fixed deterministic seed so the register flows stay focused
 	// on handler behaviour.
 	wallet.On("DeriveWalletSeed", mock.Anything, mock.AnythingOfType("string")).Return(testWalletSeed, nil)
+	wallet.On("CreateWallet", mock.Anything, mock.AnythingOfType("string"), mock.AnythingOfType("[]uint8")).Return(nil, nil)
 	env.handler = handler.NewAuthHandler(mockAuthSvc, userSvc, wallet, nil, verificationSvc, nil, nil, mockUserRepo)
 	return env
 }

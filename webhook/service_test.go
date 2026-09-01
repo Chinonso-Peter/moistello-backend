@@ -133,10 +133,10 @@ func TestDispatchPayload_DetachedBackgroundContext(t *testing.T) {
 	repo := &fakeWebhookRepo{
 		webhooks: map[string]*WebhookRegistration{
 			"wh-1": {
-				ID:        "wh-1",
-				UserID:    "user-1",
-				TargetURL: server.URL,
-				Secret:    "secret-123",
+				ID:         "wh-1",
+				UserID:     "user-1",
+				TargetURL:  server.URL,
+				SecretHash: "secret-123",
 			},
 		},
 	}
@@ -224,10 +224,10 @@ func TestDispatchPayload_PersistentRetries(t *testing.T) {
 	repo := &fakeWebhookRepo{
 		webhooks: map[string]*WebhookRegistration{
 			"wh-1": {
-				ID:        "wh-1",
-				UserID:    "user-1",
-				TargetURL: server.URL,
-				Secret:    "secret-retry",
+				ID:         "wh-1",
+				UserID:     "user-1",
+				TargetURL:  server.URL,
+				SecretHash: "secret-retry",
 			},
 		},
 	}

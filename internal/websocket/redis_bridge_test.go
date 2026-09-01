@@ -1,6 +1,7 @@
 package websocket_test
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 	"time"
@@ -33,10 +34,8 @@ func TestRedisBridge_BackpressureAndRateLimiting(t *testing.T) {
 	defer rdb.Close()
 
 	hub := websocket.NewHub()
-	go hub.Run()
 
-	bridge := websocket.NewNewRedisBridgeIfAvailable(hub, rdb)
-	// Alternatively use NewRedisBridge directly
+	bridge := websocket.NewRedisBridge(hub, rdb)
 	_ = bridge
 
 	// Test publishing payloads

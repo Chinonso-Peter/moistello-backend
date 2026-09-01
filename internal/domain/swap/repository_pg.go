@@ -2,11 +2,10 @@ package swap
 
 import (
 	"context"
-	"database/sql"
+	"fmt"
 	"time"
 
 	"github.com/jmoiron/sqlx"
-	"github.com/moistello/backend/pkg/apperrors"
 )
 
 type PostgresRepository struct {
@@ -20,143 +19,140 @@ func NewPostgresRepository(db *sqlx.DB) *PostgresRepository {
 func (r *PostgresRepository) CreateSwapOffer(ctx context.Context, offer *SwapOffer) error {
 	query := `
 		INSERT INTO swap_offers (
-			id, circle_id, offeror_user_id, offeree_user_id,
-			offeror_asset, offeror_amount, requested_asset, requested_amount,
-			status, expires_at, created_at, updated_at
-		) VALUES (
-			:id, :circle_id, :offeror_user_id, :offeree_user_id,
-			:offeror_asset, :offeror_amount, :requested_asset, :requested_amount,
-			:status, :expires_at, :created_at, :updated_at
-		)
+			id, circle_id, offeror_user_id, offeree_user_id, offeror_asset, offeror_amount,
+			requested_asset, requested_amount, status, expires_at, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 	`
-	_, err := r.db.NamedExecContext(ctx, query, offer)
-	return err
-}
 
-func (r *PostgresRepository) GetSwapOfferByID(ctx context.Context, id string) (*SwapOffer, error) {
-	query := `
-		SELECT id, circle_id, offeror_user_id, offeree_user_id,
-		       offeror_asset, offeror_amount, requested_asset, requested_amount,
-		       status, transaction_hash, expires_at, created_at, updated_at
-		FROM swap_offers WHERE id = $1
-	`
-	var offer SwapOffer
-	err := r.db.GetContext(ctx, &offer, query, id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, apperrors.ErrNotFound
-	}
-	return &offer, err
-}
+	offer.CreatedAt = time.Now()
+	offer.UpdatedAt = time.Now()
+	offer.Status = SwapOfferStatusCreated
 
-func (r *PostgresRepository) UpdateSwapOfferStatus(ctx context.Context, id string, status SwapOfferStatus, transactionHash *string) error {
-	query := `
-		UPDATE swap_offers
-		SET status = $1, transaction_hash = $2, updated_at = NOW()
-		WHERE id = $3
-	`
-	res, err := r.db.ExecContext(ctx, query, status, transactionHash, id)
+	_, err := r.db.ExecContext(ctx, query,
+		offer.ID, offer.CircleID, offer.OfferorUserID, offer.OffereeUserID,
+		offer.OfferorAsset, offer.OfferorAmount, offer.RequestedAsset, offer.RequestedAmount,
+		offer.Status, offer.ExpiresAt, offer.CreatedAt, offer.UpdatedAt,
+	)
+
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create swap offer: %w", err)
 	}
-	rows, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if rows == 0 {
-		return apperrors.ErrNotFound
-	}
+
 	return nil
 }
 
-func (r *PostgresRepository) CompareAndSwapStatus(ctx context.Context, id string, expectedStatus, newStatus SwapOfferStatus, transactionHash *string) (bool, error) {
-	query := `
-		UPDATE swap_offers
-		SET status = $1, transaction_hash = $2, updated_at = NOW()
-		WHERE id = $3 AND status = $4
-	`
-	res, err := r.db.ExecContext(ctx, query, newStatus, transactionHash, id, expectedStatus)
+func (r *PostgresRepository) GetSwapOfferByID(ctx context.Context, id string) (*SwapOffer, error) {
+	query := `SELECT * FROM swap_offers WHERE id = $1`
+
+	var offer SwapOffer
+	err := r.db.GetContext(ctx, &offer, query, id)
 	if err != nil {
-		return false, err
+		return nil, fmt.Errorf("failed to get swap offer: %w", err)
 	}
-	rows, err := res.RowsAffected()
+
+	// Note: expiry is intentionally NOT marked here. The created→expired
+	// transition releases escrow on-chain, so it is owned by the sweep worker
+	// (SweepExpiredOffers), which cancels the escrow first and then updates the
+	// row. A read path that marked offers expired without releasing escrow
+	// would orphan the escrowed funds.
+	return &offer, nil
+}
+
+func (r *PostgresRepository) UpdateSwapOfferStatus(ctx context.Context, id string, status SwapOfferStatus, transactionHash *string) error {
+	query := `UPDATE swap_offers SET status = $1, updated_at = $2`
+	params := []interface{}{status, time.Now()}
+
+	if transactionHash != nil {
+		query += ", transaction_hash = $3"
+		params = append(params, *transactionHash)
+	}
+
+	query += " WHERE id = $" + fmt.Sprintf("%d", len(params)+1)
+	params = append(params, id)
+
+	_, err := r.db.ExecContext(ctx, query, params...)
 	if err != nil {
-		return false, err
+		return fmt.Errorf("failed to update swap offer status: %w", err)
 	}
-	return rows > 0, nil
+
+	return nil
 }
 
 func (r *PostgresRepository) ListUserSwapOffers(ctx context.Context, userID string, filter SwapHistoryFilter) ([]SwapOffer, int, error) {
-	baseQuery := `FROM swap_offers WHERE offeror_user_id = $1 OR offeree_user_id = $1`
-	args := []any{userID}
-
+	baseQuery := `FROM swap_offers WHERE (offeror_user_id = $1 OR offeree_user_id = $1)`
 	countQuery := `SELECT COUNT(*) ` + baseQuery
+
+	args := []interface{}{userID}
+	argIdx := 2
+
+	if filter.CircleID != nil {
+		baseQuery += fmt.Sprintf(" AND circle_id = $%d", argIdx)
+		args = append(args, *filter.CircleID)
+		argIdx++
+	}
+
+	if filter.Status != nil {
+		baseQuery += fmt.Sprintf(" AND status = $%d", argIdx)
+		args = append(args, *filter.Status)
+		argIdx++
+	}
+
+	query := `SELECT * ` + baseQuery + ` ORDER BY created_at DESC LIMIT $` + fmt.Sprintf("%d", argIdx) + ` OFFSET $` + fmt.Sprintf("%d", argIdx+1)
+	args = append(args, filter.Limit, filter.Offset)
+
 	var total int
-	err := r.db.GetContext(ctx, &total, countQuery, args...)
+	err := r.db.GetContext(ctx, &total, countQuery, userID)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("failed to count swap offers: %w", err)
 	}
-
-	limit := filter.Limit
-	if limit <= 0 {
-		limit = 20
-	}
-	offset := filter.Offset
-
-	query := `SELECT id, circle_id, offeror_user_id, offeree_user_id,
-	                 offeror_asset, offeror_amount, requested_asset, requested_amount,
-	                 status, transaction_hash, expires_at, created_at, updated_at ` +
-		baseQuery + ` ORDER BY created_at DESC LIMIT $2 OFFSET $3`
 
 	var offers []SwapOffer
-	err = r.db.SelectContext(ctx, &offers, query, userID, limit, offset)
+	err = r.db.SelectContext(ctx, &offers, query, args...)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("failed to list swap offers: %w", err)
 	}
+
 	return offers, total, nil
 }
 
 func (r *PostgresRepository) ListCircleSwapOffers(ctx context.Context, circleID string, filter SwapHistoryFilter) ([]SwapOffer, int, error) {
 	baseQuery := `FROM swap_offers WHERE circle_id = $1`
-	args := []any{circleID}
-
 	countQuery := `SELECT COUNT(*) ` + baseQuery
+
+	args := []interface{}{circleID}
+	argIdx := 2
+
+	if filter.Status != nil {
+		baseQuery += fmt.Sprintf(" AND status = $%d", argIdx)
+		args = append(args, *filter.Status)
+		argIdx++
+	}
+
+	query := `SELECT * ` + baseQuery + ` ORDER BY created_at DESC LIMIT $` + fmt.Sprintf("%d", argIdx) + ` OFFSET $` + fmt.Sprintf("%d", argIdx+1)
+	args = append(args, filter.Limit, filter.Offset)
+
 	var total int
-	err := r.db.GetContext(ctx, &total, countQuery, args...)
+	err := r.db.GetContext(ctx, &total, countQuery, circleID)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("failed to count swap offers: %w", err)
 	}
-
-	limit := filter.Limit
-	if limit <= 0 {
-		limit = 20
-	}
-	offset := filter.Offset
-
-	query := `SELECT id, circle_id, offeror_user_id, offeree_user_id,
-	                 offeror_asset, offeror_amount, requested_asset, requested_amount,
-	                 status, transaction_hash, expires_at, created_at, updated_at ` +
-		baseQuery + ` ORDER BY created_at DESC LIMIT $2 OFFSET $3`
 
 	var offers []SwapOffer
-	err = r.db.SelectContext(ctx, &offers, query, circleID, limit, offset)
+	err = r.db.SelectContext(ctx, &offers, query, args...)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("failed to list swap offers: %w", err)
 	}
+
 	return offers, total, nil
 }
 
 func (r *PostgresRepository) ListExpiredCreatedOffers(ctx context.Context, now time.Time) ([]SwapOffer, error) {
-	query := `
-		SELECT id, circle_id, offeror_user_id, offeree_user_id,
-		       offeror_asset, offeror_amount, requested_asset, requested_amount,
-		       status, transaction_hash, expires_at, created_at, updated_at
-		FROM swap_offers
-		WHERE status = 'created' AND expires_at <= $1
-	`
+	query := `SELECT * FROM swap_offers WHERE status = $1 AND expires_at < $2`
+
 	var offers []SwapOffer
-	err := r.db.SelectContext(ctx, &offers, query, now)
-	if err != nil {
-		return nil, err
+	if err := r.db.SelectContext(ctx, &offers, query, SwapOfferStatusCreated, now); err != nil {
+		return nil, fmt.Errorf("failed to list expired swap offers: %w", err)
 	}
+
 	return offers, nil
 }

@@ -98,6 +98,7 @@ func TestEmailConsistency_RegisterStoresHashedEmail(t *testing.T) {
 
 	// Step 2 – capture what email value is written to the DB.
 	var storedUser *user.User
+	env.wallet.On("CreateWallet", mock.Anything, mock.AnythingOfType("string"), mock.AnythingOfType("[]uint8")).Return(nil, nil)
 	env.mockUserRepo.On("Create", mock.Anything, mock.AnythingOfType("*user.User")).
 		Run(func(args mock.Arguments) {
 			storedUser = args.Get(1).(*user.User)
