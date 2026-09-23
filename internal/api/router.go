@@ -100,9 +100,13 @@ func NewRouter(
 		{
 			auth.POST("/register", perResource(redisClient, "otp", cfg.RateLimit.OTPLimit, cfg.RateLimit.OTPWindowSeconds), authHandler.Register)
 			auth.POST("/register/verify", perResource(redisClient, "otp", cfg.RateLimit.OTPLimit, cfg.RateLimit.OTPWindowSeconds), authHandler.RegisterVerify)
+			auth.POST("/login", perResource(redisClient, "otp", cfg.RateLimit.OTPLimit, cfg.RateLimit.OTPWindowSeconds), authHandler.Login)
 			auth.POST("/refresh", middleware.RefreshTokenBlocklistMiddleware(redisClient), authHandler.Refresh)
 			auth.POST("/nonce", authHandler.Nonce)
 			auth.POST("/verify", authHandler.Verify)
+			auth.POST("/passkey/nonce", authHandler.PasskeyNonce)
+			auth.POST("/passkey/verify", authHandler.PasskeyVerify)
+			auth.POST("/recovery", perResource(redisClient, "otp", cfg.RateLimit.OTPLimit, cfg.RateLimit.OTPWindowSeconds), authHandler.Recovery)
 		}
 
 		authenticated := api.Group("")
@@ -117,6 +121,12 @@ func NewRouter(
 			authenticated.GET("/me", authHandler.Me)
 			authenticated.POST("/auth/logout", authHandler.Logout)
 			authenticated.DELETE("/sessions/:id", authHandler.RevokeSessionByID)
+			authenticated.GET("/sessions", authHandler.ListSessions)
+			authenticated.DELETE("/sessions", authHandler.RevokeAllSessions)
+			authenticated.POST("/auth/wallet/init", authHandler.InitWallet)
+			authenticated.POST("/auth/passkey/link", authHandler.PasskeyLink)
+			authenticated.POST("/auth/totp/setup", authHandler.SetupTOTP)
+			authenticated.POST("/auth/totp/verify", authHandler.VerifyTOTPSetup)
 
 			authenticated.POST("/users/username/claim", userHandler.ClaimName)
 
