@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
+	"github.com/moistello/backend/internal/domain/circle"
 	"github.com/moistello/backend/pkg/apperrors"
 	"github.com/moistello/backend/pkg/metrics"
 	"github.com/rs/zerolog/log"
@@ -60,6 +61,12 @@ type Service interface {
 	UpdateVerification(ctx context.Context, id string, verifiedOnchain bool, status VerificationStatus) error
 }
 
+// ServiceWithCircle adds circle service for membership/round validation.
+type ServiceWithCircle interface {
+	Service
+	SetCircleService(circleService circle.Service)
+}
+
 type service struct {
 	repo            Repository
 	broadcaster     Broadcaster
@@ -67,6 +74,7 @@ type service struct {
 	horizon         HorizonVerifier
 	payoutChecker   PayoutScheduleChecker
 	masterPublicKey string
+	circleService   circle.Service
 }
 
 // SetPayoutChecker sets the payout schedule checker on the contribution service.
@@ -80,14 +88,21 @@ func (s *service) SetPayoutChecker(checker PayoutScheduleChecker) {
 //	tx           – may be nil (no DB transaction wrapping)
 //	horizon      – may be nil (on-chain verification skipped; useful in tests)
 //	masterPK     – Stellar master public key; if empty the sender check is skipped
-func NewService(repo Repository, broadcaster Broadcaster, tx Transactor, horizon HorizonVerifier, masterPublicKey string) Service {
+//	circleSvc    – circle service for membership/round validity checks
+func NewService(repo Repository, broadcaster Broadcaster, tx Transactor, horizon HorizonVerifier, masterPublicKey string, circleSvc circle.Service) Service {
 	return &service{
 		repo:            repo,
 		broadcaster:     broadcaster,
 		tx:              tx,
 		horizon:         horizon,
 		masterPublicKey: masterPublicKey,
+		circleService:   circleSvc,
 	}
+}
+
+// SetCircleService sets the circle service for membership/round validity checks.
+func (s *service) SetCircleService(cs circle.Service) {
+	s.circleService = cs
 }
 
 // NewTransactor creates a DB-backed Transactor for the contribution domain.
@@ -181,6 +196,24 @@ func (s *service) Record(ctx context.Context, input RecordInput) (*Contribution,
 		}
 	}
 
+	// Validate membership and round validity
+	member, err := s.circleService.IsMember(ctx, input.CircleID, input.UserID)
+	if err != nil {
+		return nil, fmt.Errorf("checking membership: %w", err)
+	}
+	if !member {
+		return nil, fmt.Errorf("user is not a member of this circle")
+	}
+
+	cir, err := s.circleService.Get(ctx, input.CircleID)
+	if err != nil {
+		return nil, fmt.Errorf("getting circle: %w", err)
+	}
+
+	// Determine OnTime based on round validity against circle's current round
+	// OnTime is true only if the round number is valid (1 <= round <= current round)
+	isOnTime := input.RoundNumber >= 1 && input.RoundNumber <= cir.CurrentRound
+
 	c := &Contribution{
 		ID:                 uuid.New(),
 		CircleID:           circleUID,
@@ -189,7 +222,7 @@ func (s *service) Record(ctx context.Context, input RecordInput) (*Contribution,
 		Amount:             input.Amount,
 		TxnHash:            sql.NullString{String: input.TxnHash, Valid: input.TxnHash != ""},
 		Status:             StatusPending,
-		OnTime:             true,
+		OnTime:             isOnTime,
 		VerifiedOnchain:    verifiedOnchain,
 		VerificationStatus: verificationStatus,
 		CreatedAt:          time.Now().UTC(),
